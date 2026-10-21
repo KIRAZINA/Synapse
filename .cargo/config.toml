@@ -1,0 +1,15 @@
+# Build settings for the vendored `llama.cpp` C++ sources.
+#
+# `llama.cpp` vendors `cpp-httplib`, which requires Windows 10 (`_WIN32_WINNT
+# >= 0x0A00`) and calls the `CreateFile2` API. The MinGW-w64 headers default
+# to `_WIN32_WINNT = 0x0601`, so the C++ compilation of the vendored library
+# fails with "'::CreateFile2' has not been declared" and
+# "#error cpp-httplib doesn't support Windows 8 or lower".
+#
+# Raising the API level fixes both. The macros are unused on other platforms,
+# and Cargo never overrides `CFLAGS`/`CXXFLAGS` that are already present in
+# the environment, so a developer supplied value always wins.
+
+[env]
+CFLAGS = "-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00"
+CXXFLAGS = "-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00"

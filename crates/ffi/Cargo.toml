@@ -6,7 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Safe wrapper around the llama.cpp C++ FFI boundary for Synapse"
+build = "build.rs"
 
 [dependencies]
 synapse-core.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+flume.workspace = true
+llama-cpp-2 = { workspace = true }

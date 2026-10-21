@@ -1,18 +1,47 @@
 //! Actor model scaffolding for the inference engine.
 //!
 //! The actor owns a single dedicated OS thread. All native (`llama.cpp`) work
-//! will eventually be performed on that thread, which keeps the FFI boundary
-//! strictly isolated from the async runtime and from the networking layer.
+//! is performed on that thread, which keeps the FFI boundary strictly
+//! isolated from the async runtime and from the networking layer. Commands are
+//! sent over a channel and answered over a per-request response channel, so
+//! the async side never blocks on the inference engine.
 
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::thread;
 
 use flume::{Receiver, Sender};
-use synapse_core::SynapseError;
-use tracing::{error, info};
+use synapse_core::{SynapseError, TokenEvent};
+use synapse_ffi::context::LlamaContext;
+use synapse_ffi::model::LlamaModel;
+use synapse_ffi::{LlamaBackend, LlamaContextParams};
+use tracing::{error, info, warn};
+
+/// Size of the context window used for new inference contexts, in tokens.
+const DEFAULT_CONTEXT_SIZE: u32 = 2048;
+
+/// Fallback number of threads when the parallelism of the host is unknown.
+const DEFAULT_THREADS: i32 = 4;
 
 /// Commands accepted by the inference actor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum EngineCommand {
+    /// Load a GGUF model.
+    LoadModel {
+        /// Path of the GGUF file to load.
+        path: String,
+        /// Channel the result is sent back on.
+        response: Sender<Result<(), SynapseError>>,
+    },
+    /// Generate text for a prompt and stream it token by token.
+    Generate {
+        /// The prompt to complete.
+        prompt: String,
+        /// Maximum number of tokens to generate.
+        max_tokens: usize,
+        /// Channel the generated tokens are sent on.
+        token_sender: Sender<TokenEvent>,
+    },
     /// Stop the actor thread and release its resources.
     Shutdown,
 }
@@ -58,6 +87,53 @@ impl InferenceActor {
         })
     }
 
+    /// Loads a model.
+    ///
+    /// The work happens on the actor thread; this call only waits for the
+    /// result.
+    pub async fn load_model(&self, path: String) -> Result<(), SynapseError> {
+        let (response_sender, response_receiver) = flume::unbounded();
+
+        self.send(EngineCommand::LoadModel {
+            path,
+            response: response_sender,
+        })?;
+
+        let result = response_receiver.recv_async().await.map_err(|err| {
+            SynapseError::Engine(format!(
+                "the inference actor dropped the model loading response: {err}"
+            ))
+        })?;
+
+        result
+    }
+
+    /// Starts a streaming generation and returns the receiver of its events.
+    ///
+    /// The caller receives one [`TokenEvent::Token`] per generated token,
+    /// followed by a terminal event. Dropping the receiver aborts the
+    /// generation on the actor thread.
+    pub async fn generate_streaming(
+        &self,
+        prompt: String,
+        max_tokens: usize,
+    ) -> Result<flume::Receiver<TokenEvent>, SynapseError> {
+        let (token_sender, token_receiver) = flume::unbounded();
+
+        self.sender
+            .send_async(EngineCommand::Generate {
+                prompt,
+                max_tokens,
+                token_sender,
+            })
+            .await
+            .map_err(|err| {
+                SynapseError::Engine(format!("inference actor channel is closed: {err}"))
+            })?;
+
+        Ok(token_receiver)
+    }
+
     /// Reports whether the actor thread has already finished.
     pub fn is_finished(&self) -> bool {
         self.handle
@@ -83,15 +159,54 @@ impl InferenceActor {
     }
 }
 
-/// Body of the actor thread: a simple command loop.
+/// Body of the actor thread: the command loop.
 fn run_actor(receiver: Receiver<EngineCommand>) {
     info!("inference actor thread started");
 
-    // The loop stays alive until a shutdown command is received or the command
-    // channel is closed (which happens when every sender is dropped).
+    let backend = match synapse_ffi::init_backend() {
+        Ok(backend) => Some(backend),
+        Err(err) => {
+            error!("failed to initialise the llama.cpp backend: {err}");
+            None
+        }
+    };
+
+    // The model stays resident for the whole life of the actor. The inference
+    // context is created per request: it borrows the model, which keeps the
+    // ownership relation between the two checkable by the compiler and gives
+    // every request its own KV cache.
+    let mut model: Option<Arc<LlamaModel>> = None;
+    let context_params = context_params();
+
     let mut running = true;
     while running {
         match receiver.recv() {
+            Ok(EngineCommand::LoadModel { path, response }) => {
+                let result = load_model(backend.as_ref(), &path, &mut model);
+                if let Err(err) = &result {
+                    error!("model loading failed: {err}");
+                }
+                if response.send(result).is_err() {
+                    warn!("the model loading request was dropped before it was answered");
+                }
+            }
+            Ok(EngineCommand::Generate {
+                prompt,
+                max_tokens,
+                token_sender,
+            }) => {
+                let result = generate_streaming(
+                    model.as_ref(),
+                    backend.as_ref(),
+                    &context_params,
+                    &prompt,
+                    max_tokens,
+                    &token_sender,
+                );
+                if let Err(err) = &result {
+                    error!("generation failed: {err}");
+                }
+            }
             Ok(EngineCommand::Shutdown) => {
                 info!("inference actor received shutdown command");
                 running = false;
@@ -104,4 +219,59 @@ fn run_actor(receiver: Receiver<EngineCommand>) {
     }
 
     info!("inference actor thread exiting");
+}
+
+/// Parameters used for every inference context.
+fn context_params() -> LlamaContextParams {
+    let n_threads = std::thread::available_parallelism()
+        .map(|threads| i32::try_from(threads.get()).unwrap_or(i32::MAX))
+        .unwrap_or(DEFAULT_THREADS);
+    let n_ctx = NonZeroU32::new(DEFAULT_CONTEXT_SIZE).unwrap_or(NonZeroU32::MIN);
+
+    LlamaContextParams::default()
+        .with_n_ctx(Some(n_ctx))
+        .with_n_threads(n_threads)
+        .with_n_threads_batch(n_threads)
+}
+
+/// Loads a model and replaces the previously loaded one.
+fn load_model(
+    backend: Option<&LlamaBackend>,
+    path: &str,
+    model: &mut Option<Arc<LlamaModel>>,
+) -> Result<(), SynapseError> {
+    let backend = backend
+        .ok_or_else(|| SynapseError::Engine("the llama.cpp backend is not available".to_owned()))?;
+
+    let loaded = Arc::new(LlamaModel::load_from_file(backend, path)?);
+    *model = Some(loaded);
+
+    info!(path, "model is ready");
+    Ok(())
+}
+
+/// Runs a streaming generation request against the loaded model.
+fn generate_streaming(
+    model: Option<&Arc<LlamaModel>>,
+    backend: Option<&LlamaBackend>,
+    context_params: &LlamaContextParams,
+    prompt: &str,
+    max_tokens: usize,
+    token_sender: &Sender<TokenEvent>,
+) -> Result<(), SynapseError> {
+    let (model, backend) = match (model, backend) {
+        (Some(model), Some(backend)) => (model, backend),
+        _ => {
+            let message = "no model has been loaded yet".to_owned();
+            let _ = token_sender.send(TokenEvent::Error {
+                message: message.clone(),
+            });
+            return Err(SynapseError::Engine(message));
+        }
+    };
+
+    // The context borrows the model for the duration of the request.
+    let mut context: LlamaContext<'_> = model.new_context(backend, context_params.clone())?;
+
+    context.generate_streaming(prompt, max_tokens, token_sender.clone())
 }

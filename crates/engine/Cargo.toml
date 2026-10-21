@@ -12,4 +12,3 @@ synapse-core.workspace = true
 synapse-ffi.workspace = true
 tracing.workspace = true
 flume.workspace = true
-anyhow.workspace = true

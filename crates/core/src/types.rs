@@ -21,6 +21,45 @@ pub enum SynapseError {
     Config(String),
 }
 
+/// A single event produced by a streaming generation.
+///
+/// The engine emits one `Token` event per sampled token, followed by exactly
+/// one terminal event (`Done` or `Error`).
+#[derive(Debug, Clone)]
+pub enum TokenEvent {
+    /// A single generated token (detokenized text piece + raw token ID)
+    Token { text: String, token_id: i32 },
+    /// Generation completed successfully
+    Done {
+        total_tokens: usize,
+        elapsed_ms: u64,
+        stop_reason: StopReason,
+    },
+    /// Generation failed
+    Error { message: String },
+}
+
+/// Why a generation stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// End-of-sequence token sampled
+    Eos,
+    /// Hit max_tokens limit
+    MaxTokens,
+    /// Receiver dropped (client disconnected)
+    ClientAbort,
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eos => f.write_str("eos"),
+            Self::MaxTokens => f.write_str("max_tokens"),
+            Self::ClientAbort => f.write_str("client_abort"),
+        }
+    }
+}
+
 /// A single inference request handed to the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {
