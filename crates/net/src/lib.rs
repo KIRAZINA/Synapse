@@ -12,23 +12,30 @@
 //! [`transport::HandshakeInfo`] structure, so the QUIC stack can be replaced
 //! without touching the swarm, and the swarm can run without a data plane.
 
+pub mod client;
 pub mod discovery;
+pub mod server;
 pub mod transport;
+pub mod wire;
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use futures_util::StreamExt;
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{identity, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
-use synapse_core::SynapseError;
+use synapse_core::{SynapseError, TokenStreamProvider};
 use tracing::{info, warn};
 
 use crate::discovery::{
     HandshakeRequest, HandshakeResponse, SynapseBehaviour, SynapseBehaviourEvent,
 };
+use crate::server::InferenceServer;
 use crate::transport::QuicTransport;
+
+pub use libp2p::Multiaddr as PeerMultiaddr;
 
 /// The multiaddr the control plane listens on.
 const LISTEN_ADDRESS: &str = "/ip4/0.0.0.0/tcp/0";
@@ -39,6 +46,8 @@ pub struct NetworkNode {
     swarm: Swarm<SynapseBehaviour>,
     /// The data plane.
     quic: QuicTransport,
+    /// The provider that serves the generation requests of the peers.
+    provider: Arc<dyn TokenStreamProvider>,
     /// The identity of this node.
     peer_id: PeerId,
     /// The node that is dialed on start up, if any.
@@ -49,7 +58,10 @@ pub struct NetworkNode {
 
 impl NetworkNode {
     /// Creates a node with a fresh identity.
-    pub async fn new(bootstrap: Option<Multiaddr>) -> Result<Self, SynapseError> {
+    pub async fn new(
+        bootstrap: Option<Multiaddr>,
+        provider: Arc<dyn TokenStreamProvider>,
+    ) -> Result<Self, SynapseError> {
         let keypair = identity::Keypair::generate_ed25519();
         let peer_id = keypair.public().to_peer_id();
 
@@ -67,7 +79,13 @@ impl NetworkNode {
             })?
             .with_behaviour(|_key| behaviour)
             .map_err(|never: std::convert::Infallible| match never {})?
-            .with_swarm_config(|config| config)
+            .with_swarm_config(|config| {
+                // The control plane connection has to survive the handshake:
+                // with the default idle timeout of zero libp2p closes a
+                // connection as soon as it becomes idle, which can drop the
+                // handshake response.
+                config.with_idle_connection_timeout(std::time::Duration::from_secs(60))
+            })
             .build();
 
         let quic = QuicTransport::new().await?;
@@ -77,6 +95,7 @@ impl NetworkNode {
         Ok(Self {
             swarm,
             quic,
+            provider,
             peer_id,
             bootstrap,
             peer_addresses: HashMap::new(),
@@ -93,6 +112,10 @@ impl NetworkNode {
         &self.quic
     }
 
+    /// The provider that serves the generation requests of the peers.
+    pub fn provider(&self) -> &Arc<dyn TokenStreamProvider> {
+        &self.provider
+    }
     /// The addresses the control plane is listening on.
     pub fn listen_addresses(&self) -> Vec<Multiaddr> {
         self.swarm.listeners().cloned().collect()
@@ -112,10 +135,11 @@ impl NetworkNode {
         }
 
         // The data plane runs in its own task: the swarm loop must never be
-        // blocked by a QUIC operation.
-        let endpoint = self.quic.endpoint().clone();
+        // blocked by a QUIC operation. The server hands the generation
+        // requests to the inference provider.
+        let server = InferenceServer::new(self.quic.endpoint().clone(), Arc::clone(&self.provider));
         tokio::spawn(async move {
-            transport::accept_connections(endpoint).await;
+            server.run().await;
         });
 
         loop {
@@ -134,7 +158,7 @@ impl NetworkNode {
                 peer_id, endpoint, ..
             } => {
                 let remote = endpoint.get_remote_address();
-                if let Some(ip) = ip_from_multiaddr(remote) {
+                if let Some(ip) = discovery::ip_from_multiaddr(remote) {
                     self.peer_addresses.insert(peer_id, SocketAddr::new(ip, 0));
                 }
                 info!(%peer_id, %remote, "libp2p connection established");
@@ -227,13 +251,4 @@ impl NetworkNode {
             }
         });
     }
-}
-
-/// Extracts the IP address of a multiaddr.
-fn ip_from_multiaddr(address: &Multiaddr) -> Option<IpAddr> {
-    address.iter().find_map(|protocol| match protocol {
-        libp2p::multiaddr::Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
-        libp2p::multiaddr::Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
-        _ => None,
-    })
 }

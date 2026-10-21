@@ -17,3 +17,4 @@ rustls.workspace = true
 rcgen.workspace = true
 serde.workspace = true
 futures-util.workspace = true
+flume.workspace = true

@@ -9,6 +9,7 @@ description = "Synapse command line client"
 
 [dependencies]
 synapse-core.workspace = true
+synapse-net.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

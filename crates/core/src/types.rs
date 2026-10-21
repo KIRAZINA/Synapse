@@ -60,6 +60,23 @@ impl std::fmt::Display for StopReason {
     }
 }
 
+/// A provider of streaming inference.
+///
+/// The networking layer depends on this trait instead of on the inference
+/// engine, so the control plane, the data plane and the engine stay
+/// decoupled: the engine implements the trait, the data plane only knows the
+/// trait.
+pub trait TokenStreamProvider: Send + Sync + 'static {
+    /// Starts a streaming generation and returns the receiver of its events.
+    ///
+    /// Dropping the receiver aborts the generation.
+    fn generate_streaming(
+        &self,
+        prompt: String,
+        max_tokens: usize,
+    ) -> Result<flume::Receiver<TokenEvent>, SynapseError>;
+}
+
 /// A single inference request handed to the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {

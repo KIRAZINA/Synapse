@@ -14,13 +14,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Connection, Endpoint, ServerConfig, VarInt};
+use quinn::{ClientConfig, Endpoint, ServerConfig, VarInt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use synapse_core::SynapseError;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// The payload of the data plane smoke test.
 const PING: &[u8] = b"PING";
@@ -35,7 +35,7 @@ const ALPN: &[u8] = b"synapse/1";
 ///
 /// The certificate of a peer is self signed for `localhost`; the identity is
 /// established by pinning, not by the name.
-const SERVER_NAME: &str = "localhost";
+pub const SERVER_NAME: &str = "localhost";
 
 /// The QUIC data plane of a node.
 #[derive(Debug, Clone)]
@@ -111,41 +111,16 @@ impl QuicTransport {
         &self.endpoint
     }
 
-    /// Accepts incoming QUIC connections until the endpoint is closed.
-    pub async fn accept_connections(&self) {
-        accept_connections(self.endpoint.clone()).await;
-    }
-
     /// Connects to a peer, sends a `PING` and waits for the `PONG`.
     pub async fn connect(&self, addr: SocketAddr, cert_der: Vec<u8>) -> Result<(), SynapseError> {
         connect(self.endpoint.clone(), addr, cert_der).await
     }
 }
 
-/// Accepts incoming QUIC connections and answers the data plane smoke test.
-///
-/// Every connection is handled in its own task so that a slow peer cannot
-/// block the others.
-pub async fn accept_connections(endpoint: Endpoint) {
-    while let Some(incoming) = endpoint.accept().await {
-        tokio::spawn(async move {
-            match incoming.await {
-                Ok(connection) => {
-                    let remote = connection.remote_address();
-                    info!(%remote, "quic connection accepted");
-                    if let Err(err) = answer_ping(connection).await {
-                        warn!(%remote, "quic connection failed: {err}");
-                    }
-                }
-                Err(err) => {
-                    warn!("failed to establish the incoming quic connection: {err}");
-                }
-            }
-        });
-    }
-}
-
 /// Connects to a peer, sends a `PING` and waits for the `PONG`.
+///
+/// This is the smoke test of the data plane; the generation protocol lives in
+/// [`crate::client`].
 pub async fn connect(
     endpoint: Endpoint,
     addr: SocketAddr,
@@ -169,6 +144,9 @@ pub async fn connect(
         .await
         .map_err(|err| SynapseError::Network(format!("failed to open a quic stream: {err}")))?;
 
+    send.write_all(&[crate::wire::CMD_PING])
+        .await
+        .map_err(|err| SynapseError::Network(format!("failed to send the ping: {err}")))?;
     send.write_all(PING)
         .await
         .map_err(|err| SynapseError::Network(format!("failed to send the ping: {err}")))?;
@@ -196,40 +174,8 @@ pub async fn connect(
     Ok(())
 }
 
-/// Reads a `PING` from a stream and answers with a `PONG`.
-async fn answer_ping(connection: Connection) -> Result<(), SynapseError> {
-    let (mut send, mut recv) = connection
-        .accept_bi()
-        .await
-        .map_err(|err| SynapseError::Network(format!("failed to accept a quic stream: {err}")))?;
-
-    let mut request = [0_u8; 4];
-    recv.read_exact(&mut request)
-        .await
-        .map_err(|err| SynapseError::Network(format!("failed to read the ping: {err}")))?;
-
-    if request != PING {
-        warn!("quic stream did not carry a ping");
-        return Err(SynapseError::Network("unexpected quic payload".to_owned()));
-    }
-
-    send.write_all(PONG)
-        .await
-        .map_err(|err| SynapseError::Network(format!("failed to send the pong: {err}")))?;
-    send.finish()
-        .map_err(|err| SynapseError::Network(format!("failed to finish the pong: {err}")))?;
-
-    // The connection is kept alive until the client has finished its side of
-    // the stream, otherwise the answer could be lost when the connection is
-    // torn down.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), recv.read_to_end(0)).await;
-
-    debug!("quic ping answered");
-    Ok(())
-}
-
 /// Builds a client configuration that pins the certificate of the peer.
-fn build_client_config(cert_der: Vec<u8>) -> Result<ClientConfig, SynapseError> {
+pub fn build_client_config(cert_der: Vec<u8>) -> Result<ClientConfig, SynapseError> {
     let mut tls = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertificateVerifier {

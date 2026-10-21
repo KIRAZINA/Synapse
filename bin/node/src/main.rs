@@ -2,13 +2,15 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
 use synapse_core::TokenEvent;
 use synapse_engine::actor::InferenceActor;
-use synapse_net::discovery::parse_bootstrap;
+use synapse_net::client::RemoteInferenceClient;
+use synapse_net::discovery::{fetch_quic_info, parse_bootstrap};
 use synapse_net::NetworkNode;
 use tracing::{error, info};
 
@@ -28,6 +30,18 @@ struct Cli {
     /// Multiaddr of a bootstrap node that is dialed on start up.
     #[arg(long, value_name = "MULTIADDR")]
     bootstrap: Option<String>,
+
+    /// Multiaddr of a remote node that a prompt is forwarded to.
+    #[arg(long, value_name = "MULTIADDR")]
+    target: Option<String>,
+
+    /// Prompt that is forwarded to the remote node.
+    #[arg(long, value_name = "PROMPT")]
+    prompt: Option<String>,
+
+    /// Number of tokens that are requested from the remote node.
+    #[arg(long, default_value_t = 50, value_name = "COUNT")]
+    max_tokens: u32,
 }
 
 #[tokio::main]
@@ -36,7 +50,17 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let actor = InferenceActor::spawn();
+    // The Ctrl+C handler is installed right away: Tokio only registers it
+    // when the future is polled for the first time, and until then the
+    // default handler of the console would kill the process.
+    let (shutdown_sender, mut shutdown_receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = shutdown_sender.send(());
+        }
+    });
+
+    let actor = Arc::new(InferenceActor::spawn());
     info!("Synapse Node started successfully");
 
     // The control plane (libp2p) and the data plane (QUIC) are started in the
@@ -52,11 +76,11 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    let mut network = match NetworkNode::new(bootstrap).await {
+    let mut network = match NetworkNode::new(bootstrap, Arc::clone(&actor) as Arc<_>).await {
         Ok(network) => network,
         Err(err) => {
             error!("failed to start the network node: {err}");
-            actor.shutdown()?;
+            shutdown_actor(actor).await;
             return Ok(());
         }
     };
@@ -97,7 +121,7 @@ async fn main() -> Result<()> {
                 let consumer = tokio::spawn(stream_to_console(receiver, request_started));
 
                 // The node keeps running until it is asked to stop.
-                tokio::signal::ctrl_c().await?;
+                let _ = (&mut shutdown_receiver).await;
                 info!("shutdown signal received, stopping inference actor");
 
                 // Dropping the receiver tells the actor that nobody is
@@ -109,15 +133,110 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Forward a prompt to a remote node when one was requested.
+    if let (Some(target), Some(prompt)) = (cli.target.as_deref(), cli.prompt.as_deref()) {
+        match forward_prompt(target, prompt, cli.max_tokens, shutdown_receiver).await {
+            Ok(()) => info!("the remote generation finished"),
+            Err(err) => error!("the remote generation failed: {err}"),
+        }
+    }
+
     // Stopping the network task closes the libp2p swarm and the QUIC
     // endpoint.
     network_task.abort();
     let _ = network_task.await;
 
-    actor.shutdown()?;
+    shutdown_actor(actor).await;
 
     info!("Synapse Node stopped gracefully");
     Ok(())
+}
+
+/// Forwards a prompt to a remote node and prints the answer.
+async fn forward_prompt(
+    target: &str,
+    prompt: &str,
+    max_tokens: u32,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    let target = parse_bootstrap(target)?;
+
+    info!(%target, "requesting the quic endpoint of the remote node");
+    let (addr, cert_der) = fetch_quic_info(&target).await?;
+
+    let client = RemoteInferenceClient::new(addr, cert_der)?;
+    let (events, abort) = client.generate(prompt.to_owned(), max_tokens).await?;
+
+    let request_started = Instant::now();
+    let mut stdout = std::io::stdout();
+    let mut first_token_at: Option<Instant> = None;
+
+    loop {
+        let event = tokio::select! {
+            event = events.recv_async() => event,
+            _ = &mut shutdown => {
+                abort.abort();
+                info!("interrupted, the remote generation is aborted");
+                return Ok(());
+            }
+        };
+
+        match event {
+            Ok(TokenEvent::Token { text, .. }) => {
+                if first_token_at.is_none() {
+                    first_token_at = Some(Instant::now());
+                }
+                print!("{text}");
+                let _ = stdout.flush();
+            }
+            Ok(TokenEvent::Done {
+                total_tokens,
+                elapsed_ms,
+                stop_reason,
+            }) => {
+                println!();
+                let time_to_first_token_ms = first_token_at
+                    .map(|at| at.duration_since(request_started).as_millis())
+                    .unwrap_or(0);
+                let tokens_per_second = if elapsed_ms > 0 {
+                    total_tokens as f64 / (elapsed_ms as f64 / 1000.0)
+                } else {
+                    0.0
+                };
+                info!(
+                    total_tokens,
+                    elapsed_ms,
+                    time_to_first_token_ms,
+                    tokens_per_second,
+                    stop_reason = %stop_reason,
+                    "the remote generation is done"
+                );
+                return Ok(());
+            }
+            Ok(TokenEvent::Error { message }) => {
+                error!("the remote generation failed: {message}");
+                return Ok(());
+            }
+            Err(err) => {
+                error!("the remote generation stream ended: {err}");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Stops the inference actor.
+async fn shutdown_actor(actor: Arc<InferenceActor>) {
+    match Arc::try_unwrap(actor) {
+        Ok(actor) => {
+            if let Err(err) = actor.shutdown() {
+                error!("failed to stop the inference actor: {err}");
+            }
+        }
+        Err(_) => {
+            error!("the inference actor is still in use, it is not stopped");
+        }
+    }
 }
 
 /// Consumes the token stream and prints it as it arrives.

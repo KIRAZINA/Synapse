@@ -6,4 +6,4 @@
 
 pub mod types;
 
-pub use types::{Prompt, StopReason, SynapseError, TokenEvent};
+pub use types::{Prompt, StopReason, SynapseError, TokenEvent, TokenStreamProvider};

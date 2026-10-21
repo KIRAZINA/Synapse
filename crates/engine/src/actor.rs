@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 
 use flume::{Receiver, Sender};
-use synapse_core::{SynapseError, TokenEvent};
+use synapse_core::{SynapseError, TokenEvent, TokenStreamProvider};
 use synapse_ffi::context::LlamaContext;
 use synapse_ffi::model::LlamaModel;
 use synapse_ffi::{LlamaBackend, LlamaContextParams};
@@ -156,6 +156,24 @@ impl InferenceActor {
         }
 
         Ok(())
+    }
+}
+
+impl TokenStreamProvider for InferenceActor {
+    fn generate_streaming(
+        &self,
+        prompt: String,
+        max_tokens: usize,
+    ) -> Result<flume::Receiver<TokenEvent>, SynapseError> {
+        let (token_sender, token_receiver) = flume::unbounded();
+
+        self.send(EngineCommand::Generate {
+            prompt,
+            max_tokens,
+            token_sender,
+        })?;
+
+        Ok(token_receiver)
     }
 }
 

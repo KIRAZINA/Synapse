@@ -10,3 +10,4 @@ description = "Core shared types and error handling for Synapse"
 [dependencies]
 thiserror.workspace = true
 uuid.workspace = true
+flume.workspace = true

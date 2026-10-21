@@ -5,6 +5,8 @@
 //! tokens of a prompt travel over the QUIC data plane, which is described in
 //! [`crate::transport`].
 
+use std::net::{IpAddr, SocketAddr};
+
 use futures_util::StreamExt;
 use libp2p::identify;
 use libp2p::kad::store::MemoryStore;
@@ -130,6 +132,95 @@ pub fn log_routing_update(event: &kad::Event) {
             debug!(%peer, "kademlia peer is not routable");
         }
         _ => {}
+    }
+}
+
+/// Extracts the IP address of a multiaddr.
+pub fn ip_from_multiaddr(address: &Multiaddr) -> Option<IpAddr> {
+    address.iter().find_map(|protocol| match protocol {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
+        _ => None,
+    })
+}
+
+/// Dials a peer and returns the QUIC endpoint information of that peer.
+///
+/// The swarm that is built here is only used to reach the peer: the
+/// generation itself travels over the QUIC data plane, which is completely
+/// independent of the control plane.
+pub async fn fetch_quic_info(target: &Multiaddr) -> Result<(SocketAddr, Vec<u8>), SynapseError> {
+    let keypair = identity::Keypair::generate_ed25519();
+    let behaviour = SynapseBehaviour::new(&keypair)?;
+
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
+        .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default().nodelay(true),
+            |key: &identity::Keypair| libp2p::noise::Config::new(key),
+            libp2p::yamux::Config::default,
+        )
+        .map_err(|err| {
+            SynapseError::Network(format!("failed to configure the tcp transport: {err}"))
+        })?
+        .with_behaviour(|_key| behaviour)
+        .map_err(|never: std::convert::Infallible| match never {})?
+        .with_swarm_config(|config| {
+            // The connection has to survive the handshake: with the default
+            // idle timeout of zero libp2p closes a connection as soon as it
+            // becomes idle, which can drop the handshake response.
+            config.with_idle_connection_timeout(std::time::Duration::from_secs(60))
+        })
+        .build();
+
+    swarm
+        .dial(target.clone())
+        .map_err(|err| SynapseError::Network(format!("failed to dial {target}: {err}")))?;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut peer_ip: Option<IpAddr> = None;
+
+    loop {
+        let event = tokio::time::timeout_at(deadline, swarm.select_next_some())
+            .await
+            .map_err(|_| {
+                SynapseError::Network(format!(
+                    "timed out while waiting for the handshake with {target}"
+                ))
+            })?;
+
+        match event {
+            libp2p::swarm::SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                peer_ip = ip_from_multiaddr(endpoint.get_remote_address());
+                info!(%peer_id, %target, "libp2p connection established, requesting the handshake");
+                swarm
+                    .behaviour_mut()
+                    .request_response
+                    .send_request(&peer_id, HandshakeRequest);
+            }
+            libp2p::swarm::SwarmEvent::Behaviour(SynapseBehaviourEvent::RequestResponse(
+                request_response::Event::Message {
+                    message: request_response::Message::Response { response, .. },
+                    ..
+                },
+            )) => {
+                let ip = peer_ip.ok_or_else(|| {
+                    SynapseError::Network("the address of the peer is unknown".to_owned())
+                })?;
+
+                info!(
+                    quic_port = response.quic_port,
+                    "received the handshake response"
+                );
+                return Ok((
+                    SocketAddr::new(ip, response.quic_port),
+                    response.quic_cert_der,
+                ));
+            }
+            _ => {}
+        }
     }
 }
 
