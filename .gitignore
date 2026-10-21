@@ -1,0 +1,16 @@
+/target
+/models/
+*.gguf
+*.bin
+.env
+.DS_Store
+
+# Rust toolchain / build artifacts
+**/*.rs.bk
+*.pdb
+*.ilk
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp

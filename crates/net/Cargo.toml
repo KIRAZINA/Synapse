@@ -1,0 +1,13 @@
+[package]
+name = "synapse-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Decoupled networking layer (libp2p/QUIC) for Synapse"
+
+[dependencies]
+synapse-core.workspace = true
+tracing.workspace = true
+tokio.workspace = true

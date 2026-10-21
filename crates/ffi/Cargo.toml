@@ -1,0 +1,12 @@
+[package]
+name = "synapse-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Safe wrapper around the llama.cpp C++ FFI boundary for Synapse"
+
+[dependencies]
+synapse-core.workspace = true
+tracing.workspace = true

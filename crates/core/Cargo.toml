@@ -1,0 +1,12 @@
+[package]
+name = "synapse-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core shared types and error handling for Synapse"
+
+[dependencies]
+thiserror.workspace = true
+uuid.workspace = true
