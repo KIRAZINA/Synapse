@@ -25,3 +25,34 @@ thiserror = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 uuid = { version = "1.8", features = ["v4"] }
 llama-cpp-2 = { version = "0.1", default-features = false }
+
+# Networking. The TLS stack is pinned to the `ring` crypto provider on every
+# crate: `aws-lc-rs` (the default of `rustls` and of `quinn`) needs a CMake
+# based C build that does not work on the MinGW toolchain.
+libp2p = { version = "0.54", default-features = false, features = [
+    "tokio",
+    "noise",
+    "tcp",
+    "yamux",
+    "kad",
+    "gossipsub",
+    "request-response",
+    "macros",
+    "identify",
+    "ed25519",
+    "cbor",
+] }
+quinn = { version = "0.11", default-features = false, features = [
+    "log",
+    "runtime-tokio",
+    "rustls-ring",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "logging",
+    "std",
+    "tls12",
+] }
+rcgen = "0.14"
+serde = { version = "1", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }

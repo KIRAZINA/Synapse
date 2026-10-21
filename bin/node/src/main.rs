@@ -5,8 +5,11 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
+use clap::Parser;
 use synapse_core::TokenEvent;
 use synapse_engine::actor::InferenceActor;
+use synapse_net::discovery::parse_bootstrap;
+use synapse_net::NetworkNode;
 use tracing::{error, info};
 
 /// Model used by the local inference demo.
@@ -18,12 +21,51 @@ const DEMO_PROMPT: &str = "Hello, I am Synapse. Tell me a short joke about distr
 /// Number of tokens generated for the demo prompt.
 const DEMO_MAX_TOKENS: usize = 50;
 
+/// Command line arguments of the node.
+#[derive(Debug, Parser)]
+#[command(name = "synapse-node", version, about = "Synapse node daemon")]
+struct Cli {
+    /// Multiaddr of a bootstrap node that is dialed on start up.
+    #[arg(long, value_name = "MULTIADDR")]
+    bootstrap: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(true).init();
 
+    let cli = Cli::parse();
+
     let actor = InferenceActor::spawn();
     info!("Synapse Node started successfully");
+
+    // The control plane (libp2p) and the data plane (QUIC) are started in the
+    // background; the node keeps running until it is asked to stop.
+    let bootstrap = match cli.bootstrap.as_deref() {
+        Some(address) => match parse_bootstrap(address) {
+            Ok(address) => Some(address),
+            Err(err) => {
+                error!("{err}");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let mut network = match NetworkNode::new(bootstrap).await {
+        Ok(network) => network,
+        Err(err) => {
+            error!("failed to start the network node: {err}");
+            actor.shutdown()?;
+            return Ok(());
+        }
+    };
+
+    let network_task = tokio::spawn(async move {
+        if let Err(err) = network.run().await {
+            error!("the network task stopped: {err}");
+        }
+    });
 
     let model_path = PathBuf::from(MODEL_PATH);
     if !model_path.exists() {
@@ -66,6 +108,11 @@ async fn main() -> Result<()> {
             Err(err) => error!("failed to start the generation: {err}"),
         }
     }
+
+    // Stopping the network task closes the libp2p swarm and the QUIC
+    // endpoint.
+    network_task.abort();
+    let _ = network_task.await;
 
     actor.shutdown()?;
 
