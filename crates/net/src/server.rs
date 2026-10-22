@@ -191,9 +191,33 @@ async fn serve_generation(
     max_tokens: u32,
     mut cancelled: watch::Receiver<bool>,
 ) -> Result<(), SynapseError> {
-    let events = provider
-        .generate_streaming(prompt, max_tokens as usize)
-        .map_err(|err| SynapseError::Network(format!("failed to start the generation: {err}")))?;
+    let events = match provider.generate_streaming(prompt, max_tokens as usize) {
+        Ok(events) => events,
+        Err(err) => {
+            // A generation can be rejected before it starts. An at-capacity
+            // node does exactly that, and it is an answer, not a dead
+            // connection: reporting it as a protocol error event tells the
+            // client why the request was not served, instead of leaving it
+            // with a vague "the stream ended" message.
+            warn!(%err, "the generation was rejected");
+
+            let event = TokenEvent::Error {
+                message: err.to_string(),
+            };
+
+            if let Err(write_err) = wire::write_event(&mut send, &event).await {
+                warn!("failed to report the rejected generation: {write_err}");
+            }
+
+            // Keep the stream alive until the client has read the event and
+            // closed its side, for the same reason the terminal event of a
+            // normal generation is not followed by an immediate close.
+            let _ = tokio::time::timeout(TERMINAL_EVENT_GRACE, recv.read_to_end(0)).await;
+            let _ = send.finish();
+
+            return Ok(());
+        }
+    };
 
     // The generation itself is instrumented by the engine: the gauge, the
     // token counter and the time-to-first-token histogram cover generations

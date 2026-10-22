@@ -5,10 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Inference engine actor and orchestration for Synapse"
+description = "Inference engine pool and orchestration for Synapse"
 
 [dependencies]
 synapse-core.workspace = true
 synapse-ffi.workspace = true
 tracing.workspace = true
 flume.workspace = true
+metrics.workspace = true

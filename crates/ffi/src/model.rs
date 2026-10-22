@@ -114,6 +114,35 @@ impl LlamaModel {
         }
     }
 
+    /// Estimates the memory one context allocates for its KV cache, in bytes.
+    ///
+    /// `llama.cpp` keeps the key and value cache in `f16` by default, so every
+    /// token costs two bytes per head dimension and layer for the keys and the
+    /// same amount again for the values:
+    ///
+    /// ```text
+    /// n_ctx * n_layer * n_head_kv * (n_embd / n_head) * 2 (K + V) * 2 bytes
+    /// ```
+    ///
+    /// The estimate is deliberately simple: it is used for logging and for
+    /// warning an operator who configures a large pool, not for reserving
+    /// memory. `n_ctx` is the context window of the context that is about to
+    /// be created.
+    pub fn estimated_kv_cache_bytes(&self, n_ctx: u32) -> u64 {
+        // A zero in the metadata would be a broken model; the guards only keep
+        // the arithmetic well defined.
+        let n_head = self.inner.n_head().max(1);
+        let n_head_kv = self.inner.n_head_kv().max(1);
+        let n_embd = u32::try_from(self.inner.n_embd()).unwrap_or(0);
+        let head_dim = n_embd / n_head;
+
+        u64::from(n_ctx)
+            .saturating_mul(u64::from(self.inner.n_layer()))
+            .saturating_mul(u64::from(n_head_kv))
+            .saturating_mul(u64::from(head_dim))
+            .saturating_mul(4)
+    }
+
     /// Creates an inference context for this model.
     ///
     /// The context borrows the model, so the model has to outlive it; the

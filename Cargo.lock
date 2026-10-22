@@ -3606,6 +3606,7 @@ dependencies = [
  "serde",
  "thiserror 1.0.69",
  "toml",
+ "tracing",
  "uuid",
 ]
 
@@ -3614,6 +3615,7 @@ name = "synapse-engine"
 version = "0.1.0"
 dependencies = [
  "flume",
+ "metrics",
  "synapse-core",
  "synapse-ffi",
  "tracing",

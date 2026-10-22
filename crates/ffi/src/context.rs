@@ -37,23 +37,6 @@ use crate::model::LlamaModel;
 /// Default seed used by the sampler, kept fixed so that runs are reproducible.
 const DEFAULT_SEED: u32 = 1234;
 
-/// Keeps the active-generation gauge balanced, even when generation fails or
-/// the client disconnects half way through.
-struct ActiveGeneration;
-
-impl ActiveGeneration {
-    fn start() -> Self {
-        metrics::gauge!("synapse_active_generations").increment(1.0);
-        Self
-    }
-}
-
-impl Drop for ActiveGeneration {
-    fn drop(&mut self) {
-        metrics::gauge!("synapse_active_generations").decrement(1.0);
-    }
-}
-
 /// An inference context that borrows the model it was created from.
 ///
 /// # Ownership
@@ -113,6 +96,17 @@ impl<'model> LlamaContext<'model> {
         self.seed = seed;
     }
 
+    /// Empties the KV cache of the context.
+    ///
+    /// A context is reused for many requests by the pool, and the cache still
+    /// holds the tokens of the previous request after a generation. Clearing
+    /// it guarantees that the next request starts from a blank slate and can
+    /// never attend to tokens it did not send.
+    pub fn clear_cache(&mut self) {
+        self.inner.clear_kv_cache();
+        tracing::debug!(n_ctx = self.n_ctx, "inference context cache cleared");
+    }
+
     /// Generates up to `max_tokens` tokens for `prompt` and streams them.
     ///
     /// Every sampled token is sent to `token_sender` as a
@@ -164,10 +158,6 @@ impl<'model> LlamaContext<'model> {
                 ),
             ));
         }
-
-        // From here on the model is actually working, so the generation counts
-        // as active. The guard decrements the gauge on every exit path.
-        let _active_generation = ActiveGeneration::start();
 
         // The batch holds the whole prompt; the generated tokens are decoded
         // one at a time afterwards.

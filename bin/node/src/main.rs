@@ -11,7 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use synapse_core::{Config, TokenEvent, TokenStreamProvider, DEFAULT_CONFIG_FILE};
-use synapse_engine::actor::InferenceActor;
+use synapse_engine::InferencePool;
 use synapse_net::client::RemoteInferenceClient;
 use synapse_net::discovery::{fetch_quic_info, parse_bootstrap};
 use synapse_net::transport::TransportSettings;
@@ -104,21 +104,19 @@ async fn run() -> Result<()> {
         }
     });
 
-    let actor = Arc::new(InferenceActor::spawn(
-        config.node.max_capacity,
-        config.model.context_length,
-    ));
-    info!(
-        max_capacity = config.node.max_capacity,
-        context_length = config.model.context_length,
-        "inference actor is running"
-    );
+    // The model is loaded and every inference slot is created before the
+    // network starts. A node that cannot serve its model must not join the
+    // mesh at all: if it did, it would either advertise a model it does not
+    // have or answer every request with an error. Creating the contexts up
+    // front is also what makes `max_capacity` real: no request pays for a
+    // context (or its KV cache) any more.
+    let pool = Arc::new(load_pool(&config)?);
 
-    // The model is loaded before the network starts. A node that cannot serve
-    // its model must not join the mesh at all: if it did, it would either
-    // advertise a model it does not have or answer every request with an
-    // error.
-    load_model(&actor, &config).await?;
+    info!(
+        max_capacity = pool.capacity(),
+        context_length = config.model.context_length,
+        "inference pool is running"
+    );
 
     // Only a model that the engine reported as loaded is advertised.
     let served_models = Arc::new(ServedModels::new());
@@ -129,7 +127,7 @@ async fn run() -> Result<()> {
     let settings = network_settings(&cli, &config, Arc::clone(&served_models))?;
 
     let mut network =
-        NetworkNode::new(settings, Arc::clone(&actor) as Arc<dyn TokenStreamProvider>)
+        NetworkNode::new(settings, Arc::clone(&pool) as Arc<dyn TokenStreamProvider>)
             .await
             .map_err(|err| anyhow!("failed to start the network node: {err}"))?;
 
@@ -145,10 +143,7 @@ async fn run() -> Result<()> {
         "prompt sent"
     );
 
-    let consumer = match actor
-        .generate_streaming(DEMO_PROMPT.to_owned(), DEMO_MAX_TOKENS)
-        .await
-    {
+    let consumer = match pool.generate_streaming(DEMO_PROMPT.to_owned(), DEMO_MAX_TOKENS) {
         Ok(receiver) => {
             let request_started = Instant::now();
             Some(tokio::spawn(stream_to_console(receiver, request_started)))
@@ -161,7 +156,7 @@ async fn run() -> Result<()> {
 
     // The node keeps running until it is asked to stop.
     let _ = (&mut shutdown_receiver).await;
-    info!("shutdown signal received, stopping inference actor");
+    info!("shutdown signal received, stopping the inference pool");
 
     // Dropping the receiver tells the actor that nobody is listening any
     // more, so an in-flight generation is aborted.
@@ -183,7 +178,7 @@ async fn run() -> Result<()> {
     network_task.abort();
     let _ = network_task.await;
 
-    shutdown_actor(actor).await;
+    shutdown_pool(pool);
 
     info!("Synapse Node stopped gracefully");
     Ok(())
@@ -230,8 +225,11 @@ fn write_config_template(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Loads the configured model and fails the node when it cannot be served.
-async fn load_model(actor: &InferenceActor, config: &Config) -> Result<()> {
+/// Loads the configured model and creates one context per slot.
+///
+/// The work is blocking, and it happens before the network starts, so waiting
+/// for it cannot stall a request.
+fn load_pool(config: &Config) -> Result<InferencePool> {
     let model_path = PathBuf::from(&config.model.path);
 
     if !model_path.is_file() {
@@ -241,10 +239,12 @@ async fn load_model(actor: &InferenceActor, config: &Config) -> Result<()> {
         ));
     }
 
-    actor
-        .load_model(model_path.to_string_lossy().into_owned())
-        .await
-        .map_err(|err| anyhow!("failed to load the model '{}': {err}", model_path.display()))?;
+    let pool = InferencePool::load(
+        &model_path.to_string_lossy(),
+        config.node.max_capacity,
+        config.model.context_length,
+    )
+    .map_err(|err| anyhow!("failed to load the model '{}': {err}", model_path.display()))?;
 
     info!(
         model = %config.model.name,
@@ -252,7 +252,7 @@ async fn load_model(actor: &InferenceActor, config: &Config) -> Result<()> {
         "model loaded successfully"
     );
 
-    Ok(())
+    Ok(pool)
 }
 
 /// Translates the configuration into the settings of the networking layer.
@@ -406,16 +406,16 @@ async fn forward_prompt(
     }
 }
 
-/// Stops the inference actor.
-async fn shutdown_actor(actor: Arc<InferenceActor>) {
-    match Arc::try_unwrap(actor) {
-        Ok(actor) => {
-            if let Err(err) = actor.shutdown() {
-                error!("failed to stop the inference actor: {err}");
+/// Stops the inference pool and waits for its slot threads.
+fn shutdown_pool(pool: Arc<InferencePool>) {
+    match Arc::try_unwrap(pool) {
+        Ok(pool) => {
+            if let Err(err) = pool.shutdown() {
+                error!("failed to stop the inference pool: {err}");
             }
         }
         Err(_) => {
-            error!("the inference actor is still in use, it is not stopped");
+            error!("the inference pool is still in use, it is not stopped");
         }
     }
 }

@@ -19,6 +19,17 @@ use thiserror::Error;
 /// The configuration file that is used when no other path is given.
 pub const DEFAULT_CONFIG_FILE: &str = "synapse.toml";
 
+/// A conservative KV-cache cost of one token, in bytes.
+///
+/// The estimate is only used to warn an operator whose configuration is
+/// plausibly too large for the host. A 7B model with grouped-query attention
+/// (32 layers, 8 KV heads of 128 dimensions, stored as `f16`) costs about
+/// 128 KiB per token; smaller models cost less.
+const CONSERVATIVE_KV_BYTES_PER_TOKEN: u64 = 128 * 1024;
+
+/// The estimated KV-cache size above which the operator is warned.
+const KV_CACHE_WARN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// The commented template that `synapse-node init-config` writes.
 ///
 /// A test keeps the template in sync with [`Config::default`]: the template
@@ -36,9 +47,11 @@ const DEFAULT_TEMPLATE: &str = r#"# Synapse node configuration.
 # port; the clients learn the real address from the mesh.
 listen_addr = "/ip4/0.0.0.0/tcp/0"
 
-# The number of generations the node advertises that it can run in parallel.
-# The inference actor runs them one at a time today, so raising this only
-# changes what the node tells the mesh.
+# The number of generations the node serves in parallel. Every slot owns its
+# own inference context and KV cache and runs on its own thread, so raising
+# this really enables concurrent serving. It is bounded by memory: each slot
+# adds roughly one KV cache on top of the model. Requests that arrive while
+# every slot is busy are rejected immediately; they are never queued.
 max_capacity = 1
 
 [model]
@@ -242,6 +255,26 @@ impl Config {
             )));
         }
 
+        // Raising `max_capacity` used to be an advertisement only; it now
+        // pre-creates one context (and therefore one KV cache) per slot. The
+        // exact size depends on the model, so this is a deliberately
+        // conservative warning based on the configured window; the engine logs
+        // the precise estimate from the model metadata at startup.
+        let token_slots = u64::from(self.node.max_capacity)
+            .saturating_mul(u64::from(self.model.context_length));
+        let estimated_kv_bytes = token_slots.saturating_mul(CONSERVATIVE_KV_BYTES_PER_TOKEN);
+
+        if estimated_kv_bytes > KV_CACHE_WARN_BYTES {
+            tracing::warn!(
+                max_capacity = self.node.max_capacity,
+                context_length = self.model.context_length,
+                estimated_kv_cache_mib = estimated_kv_bytes / (1024 * 1024),
+                "node.max_capacity enables concurrent serving now, and every slot allocates its \
+                 own KV cache; make sure the host has enough memory for the model plus this cache \
+                 (the estimate is conservative)"
+            );
+        }
+
         Ok(())
     }
 }
@@ -252,7 +285,10 @@ impl Config {
 pub struct NodeConfig {
     /// The multiaddr the control plane listens on.
     pub listen_addr: String,
-    /// The number of generations the node accepts in parallel.
+    /// The number of generations the node serves in parallel.
+    ///
+    /// Every slot owns one inference context and one KV cache, so this is a
+    /// real promise, not an advertisement.
     pub max_capacity: u32,
 }
 
@@ -421,6 +457,25 @@ mod tests {
 
         let no_name = Config::from_toml_str("[model]\nname = \"\"\n");
         assert!(no_name.is_err());
+    }
+
+    #[test]
+    fn a_large_capacity_is_a_warning_not_an_error() {
+        // 64 slots of 8192 tokens are definitely more KV cache than a normal
+        // host has memory for. That is worth a warning, but it is not the
+        // configuration parser's job to decide how much memory the operator
+        // has: the node starts and the engine reports the real estimate.
+        let config = Config::from_toml_str(
+            "[node]\nmax_capacity = 64\n\n[model]\ncontext_length = 8192\n",
+        );
+
+        let config = match config {
+            Ok(config) => config,
+            Err(err) => panic!("a large capacity was rejected: {err}"),
+        };
+
+        assert_eq!(config.node.max_capacity, 64);
+        assert_eq!(config.model.context_length, 8192);
     }
 
     #[test]

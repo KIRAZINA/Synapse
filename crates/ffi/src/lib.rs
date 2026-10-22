@@ -12,11 +12,14 @@
 //! ## Threading
 //!
 //! `llama.cpp` is not thread safe. Every type in this crate must therefore be
-//! used from a single dedicated OS thread; the `synapse-engine` crate owns
-//! that thread (see `InferenceActor`).
+//! used from a single dedicated OS thread; the `synapse-engine` crate gives
+//! every pool slot its own thread. The backend itself is process wide and is
+//! initialised exactly once, no matter how many models or pools are created.
 
 pub mod context;
 pub mod model;
+
+use std::sync::{Mutex, OnceLock};
 
 use llama_cpp_2::LogOptions;
 use synapse_core::SynapseError;
@@ -29,6 +32,14 @@ pub use model::LlamaModel;
 // raw bindings crate directly.
 pub use llama_cpp_2::context::params::LlamaContextParams;
 pub use llama_cpp_2::llama_backend::LlamaBackend;
+
+/// The one and only backend of the process.
+static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+
+/// Serialises the call that actually initialises the backend, so that two
+/// threads (or two pools) cannot race on the one-shot initialisation of
+/// `llama.cpp`.
+static BACKEND_INIT: Mutex<()> = Mutex::new(());
 
 // Declares the `ggml` static archives that back the `llama.cpp` bindings.
 //
@@ -59,9 +70,25 @@ extern "C" {}
 
 /// Initialises the `llama.cpp` backend.
 ///
-/// The backend can only be initialised once per process; the returned handle
-/// must be kept alive for as long as models and contexts exist.
-pub fn init_backend() -> Result<LlamaBackend, SynapseError> {
+/// `llama.cpp` can only be initialised once per process, but a process may
+/// create several models and pools (tests do). The first call initialises the
+/// backend, every later call returns the same handle. The returned reference
+/// lives for the rest of the process.
+pub fn init_backend() -> Result<&'static LlamaBackend, SynapseError> {
+    if let Some(backend) = BACKEND.get() {
+        return Ok(backend);
+    }
+
+    let _guard = BACKEND_INIT.lock().map_err(|_| {
+        SynapseError::Engine("the llama.cpp backend initialisation lock is poisoned".to_owned())
+    })?;
+
+    // A different thread may have initialised the backend while this one was
+    // waiting for the lock.
+    if let Some(backend) = BACKEND.get() {
+        return Ok(backend);
+    }
+
     // Native log lines are forwarded into `tracing` so that they end up in the
     // same log stream as the rest of the node. They are extremely verbose, so
     // they are muted unless `SYNAPSE_LLAMA_LOGS` is set to a value other than
@@ -74,6 +101,15 @@ pub fn init_backend() -> Result<LlamaBackend, SynapseError> {
     let backend = LlamaBackend::init()
         .map_err(|err| SynapseError::Engine(format!("failed to initialise llama.cpp: {err}")))?;
 
+    if BACKEND.set(backend).is_err() {
+        return Err(SynapseError::Engine(
+            "the llama.cpp backend was initialised twice".to_owned(),
+        ));
+    }
+
     info!("llama.cpp backend initialised");
-    Ok(backend)
+
+    BACKEND.get().ok_or_else(|| {
+        SynapseError::Engine("the llama.cpp backend is not initialised after initialising it".to_owned())
+    })
 }
