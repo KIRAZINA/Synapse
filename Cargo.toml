@@ -57,6 +57,9 @@ rcgen = "0.14"
 serde = { version = "1", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# Configuration. Every operational parameter of a node lives in a TOML file.
+toml = "0.8"
+
 # Telemetry and observability.
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"

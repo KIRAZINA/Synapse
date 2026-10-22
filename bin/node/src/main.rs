@@ -2,22 +2,21 @@
 
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use clap::Parser;
+use anyhow::{anyhow, Context, Result};
+use clap::{Parser, Subcommand};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use synapse_core::TokenEvent;
+use synapse_core::{Config, TokenEvent, TokenStreamProvider, DEFAULT_CONFIG_FILE};
 use synapse_engine::actor::InferenceActor;
 use synapse_net::client::RemoteInferenceClient;
 use synapse_net::discovery::{fetch_quic_info, parse_bootstrap};
-use synapse_net::NetworkNode;
-use tracing::{error, info};
-
-/// Model used by the local inference demo.
-const MODEL_PATH: &str = "./models/TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf";
+use synapse_net::transport::TransportSettings;
+use synapse_net::{NetworkNode, NetworkSettings, PeerMultiaddr, ServedModels};
+use tracing::{error, info, warn};
 
 /// Prompt sent to the model once it is loaded.
 const DEMO_PROMPT: &str = "Hello, I am Synapse. Tell me a short joke about distributed systems.";
@@ -25,14 +24,18 @@ const DEMO_PROMPT: &str = "Hello, I am Synapse. Tell me a short joke about distr
 /// Number of tokens generated for the demo prompt.
 const DEMO_MAX_TOKENS: usize = 50;
 
-/// The port the Prometheus exporter listens on.
-const DEFAULT_METRICS_PORT: u16 = 9090;
-
 /// Command line arguments of the node.
 #[derive(Debug, Parser)]
 #[command(name = "synapse-node", version, about = "Synapse node daemon")]
 struct Cli {
-    /// Multiaddr of a bootstrap node that is dialed on start up.
+    /// Path of the TOML configuration file.
+    #[arg(long, default_value = DEFAULT_CONFIG_FILE, value_name = "PATH")]
+    config: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Multiaddr of an additional bootstrap node that is dialed on start up.
     #[arg(long, value_name = "MULTIADDR")]
     bootstrap: Option<String>,
 
@@ -47,21 +50,49 @@ struct Cli {
     /// Number of tokens that are requested from the remote node.
     #[arg(long, default_value_t = 50, value_name = "COUNT")]
     max_tokens: u32,
+}
 
-    /// Port of the Prometheus exporter.
-    #[arg(long, default_value_t = DEFAULT_METRICS_PORT, value_name = "PORT")]
-    metrics_port: u16,
+/// The subcommands of the node.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Write a commented default configuration file and exit.
+    InitConfig {
+        /// Destination of the template.
+        #[arg(long, default_value = DEFAULT_CONFIG_FILE, value_name = "PATH")]
+        out: PathBuf,
+    },
+}
+
+fn main() -> ExitCode {
+    tracing_subscriber::fmt().with_target(true).init();
+
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            error!("{err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_target(true).init();
-
+async fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Command::InitConfig { out }) = &cli.command {
+        write_config_template(out)?;
+        return Ok(());
+    }
+
+    let config = load_config(&cli.config)?;
 
     // The Prometheus exporter is isolated: a busy port or a broken exporter
     // must never take the node down.
-    start_metrics_exporter(cli.metrics_port);
+    if config.metrics.enabled {
+        start_metrics_exporter(config.metrics.port);
+    } else {
+        info!("the prometheus exporter is disabled in the configuration");
+    }
 
     // The Ctrl+C handler is installed right away: Tokio only registers it
     // when the future is polled for the first time, and until then the
@@ -73,30 +104,34 @@ async fn main() -> Result<()> {
         }
     });
 
-    let actor = Arc::new(InferenceActor::spawn());
-    info!("Synapse Node started successfully");
+    let actor = Arc::new(InferenceActor::spawn(
+        config.node.max_capacity,
+        config.model.context_length,
+    ));
+    info!(
+        max_capacity = config.node.max_capacity,
+        context_length = config.model.context_length,
+        "inference actor is running"
+    );
+
+    // The model is loaded before the network starts. A node that cannot serve
+    // its model must not join the mesh at all: if it did, it would either
+    // advertise a model it does not have or answer every request with an
+    // error.
+    load_model(&actor, &config).await?;
+
+    // Only a model that the engine reported as loaded is advertised.
+    let served_models = Arc::new(ServedModels::new());
+    served_models.set_loaded(config.model.name.clone());
 
     // The control plane (libp2p) and the data plane (QUIC) are started in the
     // background; the node keeps running until it is asked to stop.
-    let bootstrap = match cli.bootstrap.as_deref() {
-        Some(address) => match parse_bootstrap(address) {
-            Ok(address) => Some(address),
-            Err(err) => {
-                error!("{err}");
-                None
-            }
-        },
-        None => None,
-    };
+    let settings = network_settings(&cli, &config, Arc::clone(&served_models))?;
 
-    let mut network = match NetworkNode::new(bootstrap, Arc::clone(&actor) as Arc<_>).await {
-        Ok(network) => network,
-        Err(err) => {
-            error!("failed to start the network node: {err}");
-            shutdown_actor(actor).await;
-            return Ok(());
-        }
-    };
+    let mut network =
+        NetworkNode::new(settings, Arc::clone(&actor) as Arc<dyn TokenStreamProvider>)
+            .await
+            .map_err(|err| anyhow!("failed to start the network node: {err}"))?;
 
     let network_task = tokio::spawn(async move {
         if let Err(err) = network.run().await {
@@ -104,46 +139,35 @@ async fn main() -> Result<()> {
         }
     });
 
-    let model_path = PathBuf::from(MODEL_PATH);
-    if !model_path.exists() {
-        error!(
-            "model file '{}' was not found; run 'scripts/download_model.ps1' (or 'scripts/download_model.sh') to fetch it",
-            model_path.display()
-        );
-    } else {
-        match actor
-            .load_model(model_path.to_string_lossy().into_owned())
-            .await
-        {
-            Ok(()) => info!("model loaded successfully"),
-            Err(err) => error!("failed to load the model: {err}"),
+    info!(
+        prompt = DEMO_PROMPT,
+        max_tokens = DEMO_MAX_TOKENS,
+        "prompt sent"
+    );
+
+    let consumer = match actor
+        .generate_streaming(DEMO_PROMPT.to_owned(), DEMO_MAX_TOKENS)
+        .await
+    {
+        Ok(receiver) => {
+            let request_started = Instant::now();
+            Some(tokio::spawn(stream_to_console(receiver, request_started)))
         }
-
-        info!(
-            prompt = DEMO_PROMPT,
-            max_tokens = DEMO_MAX_TOKENS,
-            "prompt sent"
-        );
-
-        match actor
-            .generate_streaming(DEMO_PROMPT.to_owned(), DEMO_MAX_TOKENS)
-            .await
-        {
-            Ok(receiver) => {
-                let request_started = Instant::now();
-                let consumer = tokio::spawn(stream_to_console(receiver, request_started));
-
-                // The node keeps running until it is asked to stop.
-                let _ = (&mut shutdown_receiver).await;
-                info!("shutdown signal received, stopping inference actor");
-
-                // Dropping the receiver tells the actor that nobody is
-                // listening any more, so an in-flight generation is aborted.
-                consumer.abort();
-                let _ = consumer.await;
-            }
-            Err(err) => error!("failed to start the generation: {err}"),
+        Err(err) => {
+            error!("failed to start the generation: {err}");
+            None
         }
+    };
+
+    // The node keeps running until it is asked to stop.
+    let _ = (&mut shutdown_receiver).await;
+    info!("shutdown signal received, stopping inference actor");
+
+    // Dropping the receiver tells the actor that nobody is listening any
+    // more, so an in-flight generation is aborted.
+    if let Some(consumer) = consumer {
+        consumer.abort();
+        let _ = consumer.await;
     }
 
     // Forward a prompt to a remote node when one was requested.
@@ -163,6 +187,118 @@ async fn main() -> Result<()> {
 
     info!("Synapse Node stopped gracefully");
     Ok(())
+}
+
+/// Reads the configuration, or falls back to the defaults when the file is
+/// absent.
+///
+/// An absent file is not an error, but it is worth a warning: a node that runs
+/// with defaults should be a deliberate choice.
+fn load_config(path: &Path) -> Result<Config> {
+    if !path.exists() {
+        warn!(
+            path = %path.display(),
+            "configuration file not found, using the defaults; run `synapse-node init-config` to write a commented template"
+        );
+        return Ok(Config::default());
+    }
+
+    Ok(Config::load(path)?)
+}
+
+/// Writes the commented configuration template.
+fn write_config_template(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Err(anyhow!(
+            "'{}' already exists; pass --out <path> to write the template somewhere else",
+            path.display()
+        ));
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create the directory '{}'", parent.display())
+            })?;
+        }
+    }
+
+    std::fs::write(path, Config::default_template())
+        .with_context(|| format!("failed to write the template to '{}'", path.display()))?;
+
+    println!("wrote the configuration template to '{}'", path.display());
+    Ok(())
+}
+
+/// Loads the configured model and fails the node when it cannot be served.
+async fn load_model(actor: &InferenceActor, config: &Config) -> Result<()> {
+    let model_path = PathBuf::from(&config.model.path);
+
+    if !model_path.is_file() {
+        return Err(anyhow!(
+            "the model file '{}' was not found; run 'scripts/download_model.ps1' (or 'scripts/download_model.sh') to fetch it, or point model.path at a GGUF file",
+            model_path.display()
+        ));
+    }
+
+    actor
+        .load_model(model_path.to_string_lossy().into_owned())
+        .await
+        .map_err(|err| anyhow!("failed to load the model '{}': {err}", model_path.display()))?;
+
+    info!(
+        model = %config.model.name,
+        path = %model_path.display(),
+        "model loaded successfully"
+    );
+
+    Ok(())
+}
+
+/// Translates the configuration into the settings of the networking layer.
+fn network_settings(
+    cli: &Cli,
+    config: &Config,
+    served_models: Arc<ServedModels>,
+) -> Result<NetworkSettings> {
+    let listen_addr = config
+        .node
+        .listen_addr
+        .parse::<PeerMultiaddr>()
+        .map_err(|err| {
+            anyhow!(
+                "invalid node.listen_addr '{}': {err}",
+                config.node.listen_addr
+            )
+        })?;
+
+    let mut bootstrap = Vec::with_capacity(config.bootstrap.peers.len() + 1);
+    for peer in &config.bootstrap.peers {
+        let address = parse_bootstrap(peer)
+            .with_context(|| format!("invalid bootstrap.peers entry '{peer}'"))?;
+        if !bootstrap.contains(&address) {
+            bootstrap.push(address);
+        }
+    }
+
+    if let Some(extra) = cli.bootstrap.as_deref() {
+        let address = parse_bootstrap(extra)?;
+        if !bootstrap.contains(&address) {
+            bootstrap.push(address);
+        }
+    }
+
+    let transport = TransportSettings {
+        idle_timeout: Duration::from_millis(config.quic.idle_timeout_ms),
+        keep_alive_interval: Duration::from_millis(config.quic.keep_alive_interval_ms),
+    };
+
+    Ok(NetworkSettings {
+        listen_addr,
+        bootstrap,
+        transport,
+        served_models,
+    })
 }
 
 /// Starts the Prometheus exporter.

@@ -38,23 +38,6 @@ const ALPN: &[u8] = b"synapse/1";
 /// established by pinning, not by the name.
 pub const SERVER_NAME: &str = "localhost";
 
-/// How long a connection may stay idle before it is considered dead, in
-/// milliseconds.
-///
-/// A client that is killed, crashes or loses connectivity cannot close its
-/// connection, and it cannot reset the stream of a running generation either.
-/// The idle timeout is the only signal the server gets: without it a node
-/// would keep generating tokens for a peer that is gone. Ten seconds bounds
-/// how long a dead client can hold on to the capacity of a node.
-const IDLE_TIMEOUT_MS: u32 = 10_000;
-
-/// How often a QUIC `PING` is sent on a connection that is otherwise idle.
-///
-/// The keep-alive does two things: it keeps a healthy connection open while a
-/// client waits for the first token of a long generation, and it makes both
-/// sides notice a dead peer as soon as its acknowledgements stop arriving.
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
-
 /// Number of uni-directional streams a peer may open.
 ///
 /// The data plane never uses a uni-directional stream, so one is already
@@ -68,21 +51,51 @@ const MAX_CONCURRENT_UNI_STREAMS: u32 = 1;
 /// reconnect into a hard failure.
 const MAX_CONCURRENT_BI_STREAMS: u32 = 16;
 
-/// The QUIC transport settings of every Synapse connection.
+/// The QUIC timeouts of every Synapse connection.
 ///
 /// Both sides of a connection use the same settings: the idle timeout is
 /// negotiated as the minimum of the two, so the server cannot rely on a client
 /// being polite about it.
-fn transport_config() -> TransportConfig {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportSettings {
+    /// How long a connection may stay idle before it is considered dead.
+    ///
+    /// A client that is killed, crashes or loses connectivity cannot close its
+    /// connection, and it cannot reset the stream of a running generation
+    /// either. The idle timeout is the only signal the server gets: without it
+    /// a node would keep generating tokens for a peer that is gone.
+    pub idle_timeout: Duration,
+
+    /// How often a QUIC `PING` is sent on a connection that is otherwise idle.
+    ///
+    /// The keep-alive does two things: it keeps a healthy connection open
+    /// while a client waits for the first token of a long generation, and it
+    /// makes both sides notice a dead peer as soon as its acknowledgements
+    /// stop arriving.
+    pub keep_alive_interval: Duration,
+}
+
+impl Default for TransportSettings {
+    fn default() -> Self {
+        Self {
+            idle_timeout: Duration::from_secs(10),
+            keep_alive_interval: Duration::from_secs(5),
+        }
+    }
+}
+
+/// The QUIC transport settings of every Synapse connection.
+fn transport_config(settings: TransportSettings) -> TransportConfig {
     let mut config = TransportConfig::default();
 
     // Detect a peer that vanished instead of waiting for the default of 30
     // seconds.
-    config.max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_TIMEOUT_MS))));
+    let idle_timeout_ms = u32::try_from(settings.idle_timeout.as_millis()).unwrap_or(u32::MAX);
+    config.max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(idle_timeout_ms))));
 
     // Keep a connection alive while it carries no data, and probe the peer
     // often enough that a dead one is noticed quickly.
-    config.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    config.keep_alive_interval(Some(settings.keep_alive_interval));
 
     config.max_concurrent_uni_streams(VarInt::from_u32(MAX_CONCURRENT_UNI_STREAMS));
     config.max_concurrent_bidi_streams(VarInt::from_u32(MAX_CONCURRENT_BI_STREAMS));
@@ -108,8 +121,14 @@ pub struct QuicTransport {
 
 impl QuicTransport {
     /// Generates a certificate, binds the endpoint and prepares the TLS
-    /// configuration.
+    /// configuration with the default timeouts.
     pub async fn new() -> Result<Self, SynapseError> {
+        Self::with_settings(TransportSettings::default()).await
+    }
+
+    /// Generates a certificate, binds the endpoint and prepares the TLS
+    /// configuration with the given timeouts.
+    pub async fn with_settings(settings: TransportSettings) -> Result<Self, SynapseError> {
         install_crypto_provider();
 
         let certified =
@@ -135,7 +154,7 @@ impl QuicTransport {
             SynapseError::Network(format!("failed to build the QUIC server config: {err}"))
         })?;
         let mut server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
-        server_config.transport_config(Arc::new(transport_config()));
+        server_config.transport_config(Arc::new(transport_config(settings)));
 
         let bind_addr: SocketAddr = ([0, 0, 0, 0], 0).into();
         let endpoint = Endpoint::server(server_config, bind_addr).map_err(|err| {
@@ -150,6 +169,8 @@ impl QuicTransport {
         info!(
             port = local_port,
             certificate_bytes = cert_der.len(),
+            idle_timeout_ms = settings.idle_timeout.as_millis(),
+            keep_alive_interval_ms = settings.keep_alive_interval.as_millis(),
             "quic data plane ready"
         );
 
@@ -241,9 +262,19 @@ pub async fn connect(
 /// Builds a client configuration that pins the certificate of the peer.
 ///
 /// The transport settings are shared with the server: a client has to detect a
-/// dead node with the same ten second idle timeout that a node uses for a dead
-/// client, and its keep-alive has to outlive the longest generation.
+/// dead node with the same idle timeout that a node uses for a dead client,
+/// and its keep-alive has to outlive the longest generation. The client does
+/// not read the node configuration, so it uses the defaults; the two sides
+/// negotiate the *minimum* of their idle timeouts anyway.
 pub fn build_client_config(cert_der: Vec<u8>) -> Result<ClientConfig, SynapseError> {
+    build_client_config_with(cert_der, TransportSettings::default())
+}
+
+/// Builds a client configuration with explicit transport settings.
+pub fn build_client_config_with(
+    cert_der: Vec<u8>,
+    settings: TransportSettings,
+) -> Result<ClientConfig, SynapseError> {
     let mut tls = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedCertificateVerifier {
@@ -257,7 +288,7 @@ pub fn build_client_config(cert_der: Vec<u8>) -> Result<ClientConfig, SynapseErr
     })?;
 
     let mut config = ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(transport_config()));
+    config.transport_config(Arc::new(transport_config(settings)));
 
     Ok(config)
 }

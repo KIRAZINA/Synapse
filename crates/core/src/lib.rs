@@ -4,6 +4,11 @@
 //! the data structures that cross crate boundaries so that the networking
 //! layer and the inference engine never need to depend on each other.
 
+pub mod config;
 pub mod types;
 
+pub use config::{
+    BootstrapConfig, Config, ConfigError, MetricsConfig, ModelConfig, NodeConfig, QuicConfig,
+    DEFAULT_CONFIG_FILE,
+};
 pub use types::{NodeTelemetry, Prompt, StopReason, SynapseError, TokenEvent, TokenStreamProvider};

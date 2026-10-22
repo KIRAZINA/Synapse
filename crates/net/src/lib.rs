@@ -37,18 +37,73 @@ use crate::discovery::{
 };
 use crate::routing::{encode_telemetry, now_ms, RoutingTable};
 use crate::server::InferenceServer;
-use crate::transport::QuicTransport;
+use crate::transport::{QuicTransport, TransportSettings};
 
 pub use libp2p::Multiaddr as PeerMultiaddr;
 
 /// How often the telemetry of a node is broadcast.
 pub const TELEMETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// The models a node of this build is able to serve.
-pub const SUPPORTED_MODELS: [&str; 1] = ["tinyllama-1.1b"];
+/// The models a node has actually loaded.
+///
+/// The telemetry is built from this registry, never from the configuration: a
+/// node that fails to load its model must not advertise it. The loader records
+/// a model here only after the engine reported success.
+#[derive(Debug, Default)]
+pub struct ServedModels {
+    /// The names of the loaded models. The engine keeps one model resident,
+    /// so loading a model replaces the previous entry.
+    names: std::sync::RwLock<Vec<String>>,
+}
 
-/// The multiaddr the control plane listens on.
-const LISTEN_ADDRESS: &str = "/ip4/0.0.0.0/tcp/0";
+impl ServedModels {
+    /// Creates an empty registry: the node serves no model yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records the model that was just loaded.
+    ///
+    /// This replaces the previous entry, because the engine keeps exactly one
+    /// model resident.
+    pub fn set_loaded(&self, name: impl Into<String>) {
+        let name = name.into();
+
+        match self.names.write() {
+            Ok(mut names) => {
+                names.clear();
+                names.push(name);
+            }
+            // A poisoned lock only affects the next telemetry broadcast; the
+            // node itself keeps running.
+            Err(err) => warn!("the served model registry is poisoned: {err}"),
+        }
+    }
+
+    /// The names of the loaded models.
+    pub fn names(&self) -> Vec<String> {
+        match self.names.read() {
+            Ok(names) => names.clone(),
+            Err(err) => {
+                warn!("the served model registry is poisoned: {err}");
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// The settings a node hands to the networking layer.
+#[derive(Debug, Clone)]
+pub struct NetworkSettings {
+    /// The multiaddr the control plane listens on.
+    pub listen_addr: Multiaddr,
+    /// The bootstrap peers that are dialed on start up.
+    pub bootstrap: Vec<Multiaddr>,
+    /// The QUIC timeouts of every connection.
+    pub transport: TransportSettings,
+    /// The models the node has loaded and may advertise.
+    pub served_models: Arc<ServedModels>,
+}
 
 /// A Synapse node that takes part in the peer to peer network.
 pub struct NetworkNode {
@@ -62,8 +117,12 @@ pub struct NetworkNode {
     routing: Arc<RoutingTable>,
     /// The identity of this node.
     peer_id: PeerId,
-    /// The node that is dialed on start up, if any.
-    bootstrap: Option<Multiaddr>,
+    /// The multiaddr the control plane listens on.
+    listen_addr: Multiaddr,
+    /// The peers that are dialed on start up.
+    bootstrap: Vec<Multiaddr>,
+    /// The models this node has loaded.
+    served_models: Arc<ServedModels>,
     /// The addresses of the peers that are connected over libp2p.
     peer_addresses: HashMap<PeerId, SocketAddr>,
 }
@@ -71,7 +130,7 @@ pub struct NetworkNode {
 impl NetworkNode {
     /// Creates a node with a fresh identity.
     pub async fn new(
-        bootstrap: Option<Multiaddr>,
+        settings: NetworkSettings,
         provider: Arc<dyn TokenStreamProvider>,
     ) -> Result<Self, SynapseError> {
         let keypair = identity::Keypair::generate_ed25519();
@@ -100,7 +159,7 @@ impl NetworkNode {
             })
             .build();
 
-        let quic = QuicTransport::new().await?;
+        let quic = QuicTransport::with_settings(settings.transport).await?;
 
         info!(%peer_id, "network node initialised");
 
@@ -110,7 +169,9 @@ impl NetworkNode {
             provider,
             routing: Arc::new(RoutingTable::new()),
             peer_id,
-            bootstrap,
+            listen_addr: settings.listen_addr,
+            bootstrap: settings.bootstrap,
+            served_models: settings.served_models,
             peer_addresses: HashMap::new(),
         })
     }
@@ -142,16 +203,15 @@ impl NetworkNode {
 
     /// Runs the node until the swarm or the data plane is closed.
     pub async fn run(&mut self) -> Result<(), SynapseError> {
-        let listen_address: Multiaddr = LISTEN_ADDRESS
-            .parse()
-            .map_err(|err| SynapseError::Network(format!("invalid listen address: {err}")))?;
         self.swarm
-            .listen_on(listen_address)
+            .listen_on(self.listen_addr.clone())
             .map_err(|err| SynapseError::Network(format!("failed to listen: {err}")))?;
 
-        if let Some(bootstrap) = self.bootstrap.clone() {
-            discovery::register_bootstrap(&mut self.swarm, &bootstrap);
-            discovery::dial_bootstrap(&mut self.swarm, &bootstrap);
+        if !self.bootstrap.is_empty() {
+            for bootstrap in self.bootstrap.clone() {
+                discovery::register_bootstrap(&mut self.swarm, &bootstrap);
+                discovery::dial_bootstrap(&mut self.swarm, &bootstrap);
+            }
 
             if let Err(err) = self.swarm.behaviour_mut().kad.bootstrap() {
                 debug!("kademlia bootstrap is not possible yet: {err}");
@@ -215,7 +275,9 @@ impl NetworkNode {
             addresses,
             active_requests: self.provider.active_requests(),
             max_capacity: self.provider.max_capacity(),
-            supported_models: SUPPORTED_MODELS.iter().map(|m| (*m).to_owned()).collect(),
+            // The registry only ever contains a model that the engine loaded,
+            // so a broken model file never turns into a false advertisement.
+            supported_models: self.served_models.names(),
             timestamp_ms: now_ms(),
         };
 
@@ -239,6 +301,7 @@ impl NetworkNode {
                 info!(
                     active_requests = telemetry.active_requests,
                     max_capacity = telemetry.max_capacity,
+                    supported_models = ?telemetry.supported_models,
                     "telemetry published"
                 );
             }

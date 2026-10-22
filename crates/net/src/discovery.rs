@@ -394,9 +394,17 @@ impl DiscoverySnapshot {
         self.routing.is_empty()
     }
 
-    /// The peer with the lowest load, if any has free capacity.
-    pub fn best_peer(&self) -> Option<NodeTelemetry> {
-        self.routing.get_best_peer()
+    /// The peer with the lowest load that can serve `model`.
+    ///
+    /// When `model` is `None` any peer with free capacity is eligible; when it
+    /// is `Some`, only peers that advertise that model are considered.
+    pub fn best_peer(&self, model: Option<&str>) -> Option<NodeTelemetry> {
+        self.routing.get_best_peer(model)
+    }
+
+    /// The models that the discovered peers serve, sorted and deduplicated.
+    pub fn models(&self) -> Vec<String> {
+        self.routing.models()
     }
 
     /// The address of a peer, with its `/p2p/<id>` component restored.

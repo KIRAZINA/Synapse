@@ -90,22 +90,49 @@ impl RoutingTable {
             .collect()
     }
 
-    /// The peer with the lowest load.
+    /// The peer with the lowest load that can serve `model`.
     ///
     /// Peers that are at capacity are skipped: a request that is sent to them
-    /// would only queue up. The peer with the fewest active requests wins; ties
-    /// are broken by the peer id so that the choice is stable.
-    pub fn get_best_peer(&self) -> Option<NodeTelemetry> {
+    /// would only queue up. When a model is given, only peers that advertise
+    /// it are considered, so a client is never routed to a node that would
+    /// then fail with "no model has been loaded yet". The peer with the
+    /// fewest active requests wins; ties are broken by the peer id so that
+    /// the choice is stable.
+    pub fn get_best_peer(&self, model: Option<&str>) -> Option<NodeTelemetry> {
         self.peers
             .iter()
             .filter(|entry| !self.is_stale(entry.value()))
             .map(|entry| entry.value().clone())
             .filter(|telemetry| telemetry.active_requests < telemetry.max_capacity)
+            .filter(|telemetry| match model {
+                Some(model) => telemetry
+                    .supported_models
+                    .iter()
+                    .any(|served| served == model),
+                None => true,
+            })
             .min_by(|left, right| {
                 left.active_requests
                     .cmp(&right.active_requests)
                     .then_with(|| left.peer_id.cmp(&right.peer_id))
             })
+    }
+
+    /// The models that the known peers serve, sorted and without duplicates.
+    ///
+    /// This is what a client reports when a requested model is not available:
+    /// it tells the operator which names the mesh does know.
+    pub fn models(&self) -> Vec<String> {
+        let mut models: Vec<String> = self
+            .peers
+            .iter()
+            .filter(|entry| !self.is_stale(entry.value()))
+            .flat_map(|entry| entry.value().supported_models.clone())
+            .collect();
+
+        models.sort();
+        models.dedup();
+        models
     }
 
     /// Removes the entries that are older than the time to live.
@@ -138,11 +165,9 @@ impl RoutingTable {
 /// Decodes a telemetry payload and checks that it was sent by the peer it
 /// claims to describe.
 pub fn decode_telemetry(payload: &[u8], source: PeerId) -> Result<NodeTelemetry, String> {
-    let (telemetry, consumed) = bincode::serde::decode_from_slice::<NodeTelemetry, _>(
-        payload,
-        bincode::config::standard(),
-    )
-    .map_err(|err| format!("invalid telemetry payload: {err}"))?;
+    let (telemetry, consumed) =
+        bincode::serde::decode_from_slice::<NodeTelemetry, _>(payload, bincode::config::standard())
+            .map_err(|err| format!("invalid telemetry payload: {err}"))?;
 
     if consumed != payload.len() {
         return Err(format!(
@@ -184,13 +209,25 @@ mod tests {
     }
 
     fn telemetry(peer: &PeerId, active_requests: u32, max_capacity: u32) -> NodeTelemetry {
+        telemetry_with_models(peer, active_requests, max_capacity, &["tinyllama-1.1b"])
+    }
+
+    fn telemetry_with_models(
+        peer: &PeerId,
+        active_requests: u32,
+        max_capacity: u32,
+        supported_models: &[&str],
+    ) -> NodeTelemetry {
         NodeTelemetry {
             peer_id: peer.to_base58(),
             quic_port: 9000,
             addresses: vec!["/ip4/127.0.0.1/tcp/4001".to_owned()],
             active_requests,
             max_capacity,
-            supported_models: vec!["tinyllama-1.1b".to_owned()],
+            supported_models: supported_models
+                .iter()
+                .map(|model| (*model).to_owned())
+                .collect(),
             timestamp_ms: now_ms(),
         }
     }
@@ -209,8 +246,11 @@ mod tests {
         table.update(busy, telemetry(&busy, 3, 4));
         table.update(idle, telemetry(&idle, 0, 1));
 
-        let best = table.get_best_peer();
-        assert_eq!(best.map(|telemetry| telemetry.peer_id), Some(idle.to_base58()));
+        let best = table.get_best_peer(None);
+        assert_eq!(
+            best.map(|telemetry| telemetry.peer_id),
+            Some(idle.to_base58())
+        );
     }
 
     #[test]
@@ -220,7 +260,43 @@ mod tests {
 
         table.update(full, telemetry(&full, 1, 1));
 
-        assert!(table.get_best_peer().is_none());
+        assert!(table.get_best_peer(None).is_none());
+    }
+
+    #[test]
+    fn filters_peers_by_model() {
+        let table = RoutingTable::new();
+        let tiny = peer();
+        let llama = peer();
+
+        // `tiny` is the least loaded peer, but it does not serve llama.
+        table.update(
+            tiny,
+            telemetry_with_models(&tiny, 0, 4, &["tinyllama-1.1b"]),
+        );
+        table.update(llama, telemetry_with_models(&llama, 2, 4, &["llama-3-8b"]));
+
+        let best = table
+            .get_best_peer(Some("llama-3-8b"))
+            .map(|telemetry| telemetry.peer_id);
+        assert_eq!(best, Some(llama.to_base58()));
+
+        let best = table
+            .get_best_peer(Some("tinyllama-1.1b"))
+            .map(|telemetry| telemetry.peer_id);
+        assert_eq!(best, Some(tiny.to_base58()));
+
+        // No peer serves the requested model.
+        assert!(table.get_best_peer(Some("does-not-exist")).is_none());
+
+        // Without a filter the least loaded peer still wins.
+        let best = table.get_best_peer(None).map(|telemetry| telemetry.peer_id);
+        assert_eq!(best, Some(tiny.to_base58()));
+
+        assert_eq!(
+            table.models(),
+            vec!["llama-3-8b".to_owned(), "tinyllama-1.1b".to_owned()]
+        );
     }
 
     #[test]
@@ -231,7 +307,7 @@ mod tests {
         stale.timestamp_ms = now_ms().saturating_sub(16_000);
         table.update(dead, stale);
 
-        assert!(table.get_best_peer().is_none());
+        assert!(table.get_best_peer(None).is_none());
         assert_eq!(table.remove_stale(), 1);
         assert!(table.is_empty());
     }
@@ -248,7 +324,7 @@ mod tests {
         older.timestamp_ms = now_ms().saturating_sub(10_000);
         table.update(node, older);
 
-        let best = table.get_best_peer();
+        let best = table.get_best_peer(None);
         assert_eq!(best.map(|telemetry| telemetry.active_requests), Some(3));
     }
 

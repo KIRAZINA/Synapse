@@ -18,17 +18,8 @@ use synapse_ffi::model::LlamaModel;
 use synapse_ffi::{LlamaBackend, LlamaContextParams};
 use tracing::{error, info, warn};
 
-/// Size of the context window used for new inference contexts, in tokens.
-const DEFAULT_CONTEXT_SIZE: u32 = 2048;
-
 /// Fallback number of threads when the parallelism of the host is unknown.
 const DEFAULT_THREADS: i32 = 4;
-
-/// The number of generations a node runs in parallel.
-///
-/// The actor processes the generations one after the other on its own
-/// thread, so the capacity of a node is one.
-const MAX_CONCURRENT_GENERATIONS: u32 = 1;
 
 /// Commands accepted by the inference actor.
 #[derive(Debug)]
@@ -60,14 +51,20 @@ pub struct InferenceActor {
     handle: Option<thread::JoinHandle<()>>,
     /// The number of generations that are currently running.
     active: Arc<AtomicU32>,
+    /// The number of generations the node advertises that it can run.
+    max_capacity: u32,
 }
 
 impl InferenceActor {
     /// Spawns the actor on a dedicated OS thread.
     ///
+    /// `max_capacity` is what the telemetry of the node advertises, and
+    /// `context_length` is the context window of every inference context. Both
+    /// come from the node configuration.
+    ///
     /// If the thread cannot be created the failure is logged and the returned
     /// handle is inert; the actor never panics the caller.
-    pub fn spawn() -> Self {
+    pub fn spawn(max_capacity: u32, context_length: u32) -> Self {
         let (sender, receiver) = flume::unbounded::<EngineCommand>();
 
         // The counter of the running generations is shared with the telemetry
@@ -77,13 +74,14 @@ impl InferenceActor {
 
         let handle = thread::Builder::new()
             .name("synapse-inference-actor".to_string())
-            .spawn(move || run_actor(receiver, thread_active));
+            .spawn(move || run_actor(receiver, thread_active, context_length));
 
         match handle {
             Ok(handle) => Self {
                 sender,
                 handle: Some(handle),
                 active,
+                max_capacity,
             },
             Err(err) => {
                 error!("failed to spawn inference actor thread: {err}");
@@ -91,6 +89,7 @@ impl InferenceActor {
                     sender,
                     handle: None,
                     active,
+                    max_capacity,
                 }
             }
         }
@@ -163,6 +162,7 @@ impl InferenceActor {
             sender,
             handle,
             active: _,
+            max_capacity: _,
         } = self;
 
         sender.send(EngineCommand::Shutdown).map_err(|err| {
@@ -201,12 +201,16 @@ impl TokenStreamProvider for InferenceActor {
     }
 
     fn max_capacity(&self) -> u32 {
-        MAX_CONCURRENT_GENERATIONS
+        self.max_capacity
     }
 }
 
 /// Body of the actor thread: the command loop.
-fn run_actor(receiver: Receiver<EngineCommand>, active_generations: Arc<AtomicU32>) {
+fn run_actor(
+    receiver: Receiver<EngineCommand>,
+    active_generations: Arc<AtomicU32>,
+    context_length: u32,
+) {
     info!("inference actor thread started");
 
     let backend = match synapse_ffi::init_backend() {
@@ -222,7 +226,7 @@ fn run_actor(receiver: Receiver<EngineCommand>, active_generations: Arc<AtomicU3
     // ownership relation between the two checkable by the compiler and gives
     // every request its own KV cache.
     let mut model: Option<Arc<LlamaModel>> = None;
-    let context_params = context_params();
+    let context_params = context_params(context_length);
 
     let mut running = true;
     while running {
@@ -274,11 +278,11 @@ fn run_actor(receiver: Receiver<EngineCommand>, active_generations: Arc<AtomicU3
 }
 
 /// Parameters used for every inference context.
-fn context_params() -> LlamaContextParams {
+fn context_params(context_length: u32) -> LlamaContextParams {
     let n_threads = std::thread::available_parallelism()
         .map(|threads| i32::try_from(threads.get()).unwrap_or(i32::MAX))
         .unwrap_or(DEFAULT_THREADS);
-    let n_ctx = NonZeroU32::new(DEFAULT_CONTEXT_SIZE).unwrap_or(NonZeroU32::MIN);
+    let n_ctx = NonZeroU32::new(context_length).unwrap_or(NonZeroU32::MIN);
 
     LlamaContextParams::default()
         .with_n_ctx(Some(n_ctx))
