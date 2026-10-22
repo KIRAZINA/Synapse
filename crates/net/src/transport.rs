@@ -12,9 +12,10 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Endpoint, ServerConfig, VarInt};
+use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig, VarInt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -37,6 +38,66 @@ const ALPN: &[u8] = b"synapse/1";
 /// established by pinning, not by the name.
 pub const SERVER_NAME: &str = "localhost";
 
+/// How long a connection may stay idle before it is considered dead, in
+/// milliseconds.
+///
+/// A client that is killed, crashes or loses connectivity cannot close its
+/// connection, and it cannot reset the stream of a running generation either.
+/// The idle timeout is the only signal the server gets: without it a node
+/// would keep generating tokens for a peer that is gone. Ten seconds bounds
+/// how long a dead client can hold on to the capacity of a node.
+const IDLE_TIMEOUT_MS: u32 = 10_000;
+
+/// How often a QUIC `PING` is sent on a connection that is otherwise idle.
+///
+/// The keep-alive does two things: it keeps a healthy connection open while a
+/// client waits for the first token of a long generation, and it makes both
+/// sides notice a dead peer as soon as its acknowledgements stop arriving.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Number of uni-directional streams a peer may open.
+///
+/// The data plane never uses a uni-directional stream, so one is already
+/// generous.
+const MAX_CONCURRENT_UNI_STREAMS: u32 = 1;
+
+/// Number of bi-directional streams a peer may open.
+///
+/// A client normally uses one stream per generation, but the limit is not
+/// tightened to one: the request/response pattern of a peer should not turn a
+/// reconnect into a hard failure.
+const MAX_CONCURRENT_BI_STREAMS: u32 = 16;
+
+/// The QUIC transport settings of every Synapse connection.
+///
+/// Both sides of a connection use the same settings: the idle timeout is
+/// negotiated as the minimum of the two, so the server cannot rely on a client
+/// being polite about it.
+fn transport_config() -> TransportConfig {
+    let mut config = TransportConfig::default();
+
+    // Detect a peer that vanished instead of waiting for the default of 30
+    // seconds.
+    config.max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_TIMEOUT_MS))));
+
+    // Keep a connection alive while it carries no data, and probe the peer
+    // often enough that a dead one is noticed quickly.
+    config.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+
+    config.max_concurrent_uni_streams(VarInt::from_u32(MAX_CONCURRENT_UNI_STREAMS));
+    config.max_concurrent_bidi_streams(VarInt::from_u32(MAX_CONCURRENT_BI_STREAMS));
+
+    config
+}
+
+/// Installs the process level crypto provider of the TLS stack.
+///
+/// The TLS crates can be built with more than one provider, in which case
+/// `rustls` refuses to guess. The provider is selected explicitly instead.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// The QUIC data plane of a node.
 #[derive(Debug, Clone)]
 pub struct QuicTransport {
@@ -49,6 +110,8 @@ impl QuicTransport {
     /// Generates a certificate, binds the endpoint and prepares the TLS
     /// configuration.
     pub async fn new() -> Result<Self, SynapseError> {
+        install_crypto_provider();
+
         let certified =
             rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_owned()]).map_err(|err| {
                 SynapseError::Network(format!("failed to generate the TLS certificate: {err}"))
@@ -71,7 +134,8 @@ impl QuicTransport {
         let server_crypto = QuicServerConfig::try_from(server_tls).map_err(|err| {
             SynapseError::Network(format!("failed to build the QUIC server config: {err}"))
         })?;
-        let server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
+        let mut server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
+        server_config.transport_config(Arc::new(transport_config()));
 
         let bind_addr: SocketAddr = ([0, 0, 0, 0], 0).into();
         let endpoint = Endpoint::server(server_config, bind_addr).map_err(|err| {
@@ -175,6 +239,10 @@ pub async fn connect(
 }
 
 /// Builds a client configuration that pins the certificate of the peer.
+///
+/// The transport settings are shared with the server: a client has to detect a
+/// dead node with the same ten second idle timeout that a node uses for a dead
+/// client, and its keep-alive has to outlive the longest generation.
 pub fn build_client_config(cert_der: Vec<u8>) -> Result<ClientConfig, SynapseError> {
     let mut tls = rustls::ClientConfig::builder()
         .dangerous()
@@ -188,7 +256,10 @@ pub fn build_client_config(cert_der: Vec<u8>) -> Result<ClientConfig, SynapseErr
         SynapseError::Network(format!("failed to build the QUIC client config: {err}"))
     })?;
 
-    Ok(ClientConfig::new(Arc::new(crypto)))
+    let mut config = ClientConfig::new(Arc::new(crypto));
+    config.transport_config(Arc::new(transport_config()));
+
+    Ok(config)
 }
 
 /// The signature schemes that are accepted for the pinned certificate.

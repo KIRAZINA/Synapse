@@ -7,15 +7,39 @@
 //!
 //! The provider is a trait, so the data plane does not depend on the engine.
 //! The engine implements the trait and the node wires both together.
+//!
+//! # Stopping a generation
+//!
+//! A generation has to stop as soon as nobody is waiting for its tokens, and
+//! it has to stop without the client saying so. A client that is killed with
+//! `SIGKILL`, that crashes or that loses connectivity never sends the stream
+//! reset of a graceful abort, and a write to a dead peer does not fail over
+//! UDP either. Three signals cover that, in the order the server sees them:
+//!
+//! * the other half of the stream ends or is reset, which is what an abort of
+//!   a live client looks like,
+//! * a write to the stream fails, which happens when the stream is reset but
+//!   the connection is still usable,
+//! * the connection closes, which the QUIC idle timeout reports for a peer
+//!   that simply stopped answering.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use synapse_core::{SynapseError, TokenEvent, TokenStreamProvider};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, warn};
 
 use crate::wire;
+
+/// How long the server waits for the client to close its side of a stream
+/// after the terminal event of a generation was sent.
+///
+/// The wait is what keeps the terminal event from being discarded: a
+/// connection that is closed immediately drops stream data that has not been
+/// acknowledged yet. It only guards against a client that never closes.
+const TERMINAL_EVENT_GRACE: Duration = Duration::from_secs(5);
 
 /// The QUIC server that serves generation requests.
 #[derive(Clone)]
@@ -45,9 +69,7 @@ impl InferenceServer {
                     Ok(connection) => {
                         let remote = connection.remote_address();
                         info!(%remote, "quic connection accepted");
-                        if let Err(err) = handle_connection(provider, connection).await {
-                            warn!(%remote, "the quic connection failed: {err}");
-                        }
+                        handle_connection(provider, connection).await;
                     }
                     Err(err) => {
                         warn!("failed to establish the incoming quic connection: {err}");
@@ -58,15 +80,68 @@ impl InferenceServer {
     }
 }
 
-/// Handles a single connection: dispatches the command and serves it.
-async fn handle_connection(
+/// Serves the streams of a single connection until the connection is closed.
+///
+/// The connection is the unit of cancellation: when it ends, for whatever
+/// reason, every generation that is running on it is aborted. Each stream is
+/// served in its own task, so one slow generation does not stop the
+/// connection from accepting the next stream.
+async fn handle_connection(provider: Arc<dyn TokenStreamProvider>, connection: Connection) {
+    let remote = connection.remote_address();
+
+    // `watch` is used instead of `Notify` because it remembers the
+    // cancellation: a stream that is accepted just before the connection is
+    // closed still observes it. The channel is closed as well when this task
+    // ends, which is a cancellation of its own.
+    let (cancel_sender, cancel_receiver) = watch::channel(false);
+
+    loop {
+        tokio::select! {
+            // The closure is checked first: a closed connection makes both
+            // branches ready at the same time, and the reason of the closure
+            // is the useful message.
+            biased;
+
+            reason = connection.closed() => {
+                // The peer is gone: gracefully, by an idle timeout while it
+                // kept quiet, or by being killed. Nobody is waiting for the
+                // tokens of this connection any more.
+                info!(%remote, reason = %reason, "the quic connection closed");
+                break;
+            }
+            stream = connection.accept_bi() => {
+                let (send, recv) = match stream {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        info!(%remote, "failed to accept a quic stream: {err}");
+                        break;
+                    }
+                };
+
+                let provider = Arc::clone(&provider);
+                let cancelled = cancel_receiver.clone();
+
+                tokio::spawn(async move {
+                    if let Err(err) = handle_stream(provider, send, recv, cancelled).await {
+                        warn!(%remote, "the quic stream failed: {err}");
+                    }
+                });
+            }
+        }
+    }
+
+    // Cancelling the token aborts every generation that still runs on this
+    // connection, including the ones whose client died without saying goodbye.
+    let _ = cancel_sender.send(true);
+}
+
+/// Handles a single stream: dispatches the command and serves it.
+async fn handle_stream(
     provider: Arc<dyn TokenStreamProvider>,
-    connection: Connection,
+    mut send: SendStream,
+    mut recv: RecvStream,
+    cancelled: watch::Receiver<bool>,
 ) -> Result<(), SynapseError> {
-    let (mut send, mut recv) = connection
-        .accept_bi()
-        .await
-        .map_err(|err| SynapseError::Network(format!("failed to accept a quic stream: {err}")))?;
     // The command byte decides which protocol is spoken on the stream.
     let mut command = [0_u8; 1];
     recv.read_exact(&mut command)
@@ -79,7 +154,7 @@ async fn handle_connection(
                 SynapseError::Network(format!("failed to read the request: {err}"))
             })?;
 
-            serve_generation(provider, send, recv, prompt, max_tokens).await
+            serve_generation(provider, send, recv, prompt, max_tokens, cancelled).await
         }
         wire::CMD_PING => {
             // The data plane smoke test of the control plane phase.
@@ -93,11 +168,10 @@ async fn handle_connection(
                 .map_err(|err| SynapseError::Network(format!("failed to send the pong: {err}")))?;
             let _ = send.finish();
 
-            // The connection is kept alive until the client has finished its
-            // side of the stream, otherwise the answer could be lost when the
-            // connection is torn down.
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(5), recv.read_to_end(0)).await;
+            // The stream is kept alive until the client has finished its side
+            // of it, otherwise the answer could be lost when the stream is
+            // torn down.
+            let _ = tokio::time::timeout(TERMINAL_EVENT_GRACE, recv.read_to_end(0)).await;
 
             debug!("quic ping answered");
             Ok(())
@@ -115,15 +189,18 @@ async fn serve_generation(
     mut recv: RecvStream,
     prompt: String,
     max_tokens: u32,
+    mut cancelled: watch::Receiver<bool>,
 ) -> Result<(), SynapseError> {
     let events = provider
         .generate_streaming(prompt, max_tokens as usize)
         .map_err(|err| SynapseError::Network(format!("failed to start the generation: {err}")))?;
 
+    // The generation itself is instrumented by the engine: the gauge, the
+    // token counter and the time-to-first-token histogram cover generations
+    // that are served over QUIC as well as generations that run locally.
+
     // The other half of the stream is watched: a client that resets or closes
-    // it is gone, and the generation has to stop. Without this the generation
-    // would run into the token limit, because a write to a dead peer does not
-    // fail over UDP.
+    // it is gone, and the generation has to stop.
     let (abort_sender, mut abort_receiver) = oneshot::channel();
     let watcher = tokio::spawn(async move {
         let _ = recv.read_to_end(0).await;
@@ -161,6 +238,15 @@ async fn serve_generation(
                 warn!("the client disconnected, the generation is aborted");
                 break;
             }
+            _ = cancelled.changed() => {
+                // The connection is closed, which is the only signal that
+                // reaches the server when the client was killed or lost its
+                // network: it cannot reset the stream any more. The channel
+                // reports an error when the connection task is gone, which
+                // means the same thing here.
+                warn!("the quic connection is gone, the generation is aborted");
+                break;
+            }
         }
     }
 
@@ -172,7 +258,15 @@ async fn serve_generation(
         info!("the generation was aborted before it completed");
     }
 
-    watcher.abort();
+    // The last event of a generation is only delivered reliably while the
+    // connection is still alive: closing it right away discards stream data
+    // that has not been acknowledged yet, and the client would report a lost
+    // connection instead of the terminal event. The watcher finishes as soon
+    // as the client closes its side of the stream, which it does after it has
+    // seen the terminal event; a client that is gone has already finished it
+    // as well. The timeout only guards against a client that never closes.
+    let _ = tokio::time::timeout(TERMINAL_EVENT_GRACE, watcher).await;
+
     let _ = send.finish();
     Ok(())
 }
