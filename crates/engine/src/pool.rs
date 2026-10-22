@@ -24,21 +24,40 @@
 //!
 //! # Context hygiene
 //!
-//! A context is reused by many requests. Every generation is followed by
-//! [`LlamaContext::clear_cache`], so the next request starts with an empty KV
-//! cache and never attends to tokens that belong to a previous client.
+//! A context is reused by many requests. Before the KV cache was valuable the
+//! pool simply cleared it after every generation. Phase 8 keeps the prompt
+//! tokens instead: after a generation the completion tokens are trimmed away,
+//! and the slot remembers the token IDs that are still resident in its cache.
+//! The next request reuses the longest common prefix of its own prompt with
+//! that cache, so a shared system prompt is only prefilled once per slot.
+//!
+//! The cache is strictly per slot: slots never share KV state, there is no
+//! radix tree and no eviction. Correctness always wins over a hit: any error
+//! while retaining the prefix, any failed trim and every panic falls back to a
+//! full [`LlamaContext::clear_cache`] and a prompt prefill from zero. A panic
+//! is caught around the whole generation; the slot's cache is cleared before
+//! the guard is released, and a slot whose context cannot even be cleared is
+//! retired instead of being handed to the next client.
 
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 use flume::{Receiver, Sender};
 use synapse_core::{SynapseError, TokenEvent, TokenStreamProvider};
 use synapse_ffi::model::LlamaModel;
-use synapse_ffi::{LlamaBackend, LlamaContextParams};
+use synapse_ffi::{LlamaBackend, LlamaContext, LlamaContextParams};
 use tracing::{error, info, warn};
+
+/// Test hook: forces the next generation to panic after its completion tokens
+/// were decoded and before the slot is trimmed.
+///
+/// The integration tests set this to prove that a panic cannot leak a dirty KV
+/// cache into the next request. The node never sets it.
+#[doc(hidden)]
+pub static FORCE_PANIC_AFTER_GENERATION: AtomicBool = AtomicBool::new(false);
 
 /// Fallback number of threads when the parallelism of the host is unknown.
 const DEFAULT_THREADS: usize = 4;
@@ -79,6 +98,20 @@ impl SlotGuard {
     pub fn index(&self) -> Option<usize> {
         self.slot.as_ref().map(|slot| slot.index)
     }
+
+    /// Releases the slot without returning it to the pool.
+    ///
+    /// Used when the context of the slot could not be proven clean (the panic
+    /// cleanup itself failed). Such a context is never reused: the slot is
+    /// retired instead of being recycled, the busy counter is decremented and
+    /// the pool keeps serving with the remaining slots.
+    pub fn retire(mut self) {
+        self.slot.take();
+        error!("an inference slot was retired because its context could not be cleaned");
+
+        let busy = self.active.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
+        metrics::gauge!("synapse_active_generations").set(busy as f64);
+    }
 }
 
 impl Drop for SlotGuard {
@@ -97,10 +130,7 @@ impl Drop for SlotGuard {
             warn!("the inference pool is gone, the slot was not returned");
         }
 
-        let busy = self
-            .active
-            .fetch_sub(1, Ordering::AcqRel)
-            .saturating_sub(1);
+        let busy = self.active.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
         metrics::gauge!("synapse_active_generations").set(busy as f64);
     }
 }
@@ -185,10 +215,15 @@ impl InferencePool {
     /// cannot create all of its slots fails at startup instead of advertising
     /// a capacity it cannot serve. The work happens on the calling thread; the
     /// node calls this before it starts the network.
+    ///
+    /// When `enable_prefix_caching` is `false`, every generation starts from
+    /// an empty KV cache: the pool behaves exactly like it did before the
+    /// prefix cache existed.
     pub fn load(
         path: &str,
         max_capacity: u32,
         context_length: u32,
+        enable_prefix_caching: bool,
     ) -> Result<Self, SynapseError> {
         let capacity = usize::try_from(max_capacity).map_err(|_| {
             SynapseError::Engine("node.max_capacity does not fit into a usize".to_owned())
@@ -212,6 +247,7 @@ impl InferencePool {
             n_ctx = context_length,
             kv_cache_mib_per_slot = kv_mib_per_slot,
             kv_cache_mib_total = kv_mib_total,
+            prefix_caching = enable_prefix_caching,
             "starting the inference pool"
         );
 
@@ -239,6 +275,7 @@ impl InferencePool {
                 free: release.clone(),
                 ready: ready_sender.clone(),
                 own_sender: command_sender,
+                enable_prefix_caching,
             };
 
             let builder = thread::Builder::new().name(format!("synapse-inference-slot-{index}"));
@@ -452,6 +489,8 @@ struct SlotStartup {
     ready: Sender<Result<(), SynapseError>>,
     /// A sender to its own command channel, stored in the ready [`Slot`].
     own_sender: Sender<SlotCommand>,
+    /// Whether a slot may reuse the prompt prefix that is in its KV cache.
+    enable_prefix_caching: bool,
 }
 
 impl SlotStartup {
@@ -466,6 +505,7 @@ impl SlotStartup {
             free,
             ready,
             own_sender,
+            enable_prefix_caching,
         } = self;
 
         // The context borrows the model, so both live on this thread. The
@@ -490,7 +530,10 @@ impl SlotStartup {
             })
             .is_err()
         {
-            error!(slot = index, "the inference pool is gone, stopping the slot");
+            error!(
+                slot = index,
+                "the inference pool is gone, stopping the slot"
+            );
             return;
         }
 
@@ -500,7 +543,17 @@ impl SlotStartup {
             return;
         }
 
-        info!(slot = index, n_ctx = context.n_ctx(), "inference slot is ready");
+        info!(
+            slot = index,
+            n_ctx = context.n_ctx(),
+            "inference slot is ready"
+        );
+
+        // The prompt tokens that are currently resident in the KV cache of
+        // this context. It is the only source of truth for prefix reuse: the
+        // slot compares the next prompt against it, and it is emptied whenever
+        // the cache is cleared or its state is in doubt.
+        let mut cached_prefix: Vec<i32> = Vec::new();
 
         while let Ok(command) = commands.recv() {
             match command {
@@ -510,29 +563,44 @@ impl SlotStartup {
                     token_sender,
                     guard,
                 } => {
-                    // A panic in the generation must not take the slot out of
-                    // the pool: the guard is dropped by the unwind, and the
-                    // cache is cleared below before the guard is released.
+                    // A panic anywhere in the generation path is caught here.
+                    // The cleanup below runs before the guard can return the
+                    // slot, so a panicked context is never handed to the next
+                    // request without a full clear.
                     let outcome = catch_unwind(AssertUnwindSafe(|| {
-                        context.generate_streaming(&prompt, max_tokens, token_sender)
+                        run_generation(
+                            &mut context,
+                            &mut cached_prefix,
+                            &prompt,
+                            max_tokens,
+                            token_sender,
+                            enable_prefix_caching,
+                            index,
+                        )
                     }));
 
-                    // Clear on every path, before the slot can be handed to
-                    // the next request.
-                    context.clear_cache();
-
-                    match outcome {
-                        Ok(Ok(())) => {}
+                    let clean = match outcome {
+                        Ok(Ok(())) => true,
                         Ok(Err(err)) => {
                             error!(slot = index, "generation failed: {err}");
+                            clear_after_failure(&mut context, &mut cached_prefix, index)
                         }
                         Err(_) => {
-                            error!(slot = index, "the generation panicked");
+                            error!(
+                                slot = index,
+                                "the generation panicked; clearing the context before reuse"
+                            );
+                            clear_after_failure(&mut context, &mut cached_prefix, index)
                         }
-                    }
+                    };
 
-                    // Releases the slot and decrements the busy counter.
-                    drop(guard);
+                    if clean {
+                        // Releases the slot and decrements the busy counter.
+                        drop(guard);
+                    } else {
+                        // The context could not be cleared: never reuse it.
+                        guard.retire();
+                    }
                 }
                 SlotCommand::Shutdown => {
                     info!(slot = index, "inference slot received shutdown command");
@@ -542,6 +610,147 @@ impl SlotStartup {
         }
 
         info!(slot = index, "inference slot is exiting");
+    }
+}
+
+/// Length of the longest common prefix of two token sequences.
+///
+/// The prefix cache compares token IDs, not bytes: two prompts that render the
+/// same text tokenize to the same IDs, and only a shared *token* prefix can be
+/// reused from the KV cache. The function is pure and model independent so the
+/// cache decision can be unit tested without loading a model.
+pub fn longest_common_prefix(left: &[i32], right: &[i32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+/// Serves one generation on a slot, including the prefix cache decisions.
+///
+/// Returns an error when the request could not be served. The caller treats
+/// every error (and every panic) as a reason to clear the whole context, so
+/// this function does not have to restore a consistent cache state itself.
+fn run_generation(
+    context: &mut LlamaContext<'_>,
+    cached_prefix: &mut Vec<i32>,
+    prompt: &str,
+    max_tokens: usize,
+    token_sender: Sender<TokenEvent>,
+    enable_prefix_caching: bool,
+    slot: usize,
+) -> Result<(), SynapseError> {
+    let tokens = match context.tokenize_prompt(prompt) {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            let _ = token_sender.send(TokenEvent::Error {
+                message: err.to_string(),
+            });
+            return Err(err);
+        }
+    };
+
+    let mut prefill_from = 0usize;
+
+    if enable_prefix_caching {
+        metrics::counter!("synapse_prefix_cache_requests_total").increment(1);
+
+        let shared = longest_common_prefix(cached_prefix, &tokens);
+
+        // The logits of the last prompt token are not part of the KV cache:
+        // the sampler needs the logits of the token it continues from. Even a
+        // prompt that is completely cached therefore has to evaluate its last
+        // token again, which makes `tokens.len() - 1` the largest reusable
+        // prefix.
+        let reusable = shared.min(tokens.len() - 1);
+
+        let retained = if reusable == 0 {
+            // Nothing to reuse (or the slot is cold): start from a clean
+            // cache instead of trusting whatever state it has.
+            context.clear_cache();
+            true
+        } else {
+            match context.retain_prefix(reusable) {
+                Ok(()) => true,
+                Err(err) => {
+                    // The cache is in a state we do not understand. Correctness
+                    // wins over the hit: throw it away and prefill everything.
+                    warn!(
+                        slot,
+                        "the cached prefix could not be retained, prefilling from zero: {err}"
+                    );
+                    context.clear_cache();
+                    false
+                }
+            }
+        };
+
+        if retained {
+            prefill_from = reusable;
+
+            if prefill_from > 0 {
+                metrics::counter!("synapse_prefix_cache_hits_total").increment(1);
+                metrics::counter!("synapse_prefill_tokens_saved_total")
+                    .increment(prefill_from as u64);
+                info!(
+                    slot,
+                    prompt_tokens = tokens.len(),
+                    reused_tokens = prefill_from,
+                    prefill_tokens = tokens.len() - prefill_from,
+                    "prefix cache hit"
+                );
+            }
+        }
+    } else {
+        // The disabled path is the Phase 7 path: every generation starts from
+        // an empty KV cache.
+        context.clear_cache();
+    }
+
+    context.prefill_and_generate(&tokens, prefill_from, max_tokens, token_sender)?;
+
+    // Test hook. It fires after the completion tokens were decoded and before
+    // the slot is trimmed, which is exactly the state a panic in the middle of
+    // a generation would leave behind.
+    if FORCE_PANIC_AFTER_GENERATION.swap(false, Ordering::SeqCst) {
+        panic!("the test hook forced a panic after the generation");
+    }
+
+    if enable_prefix_caching {
+        // Drop the completion tokens: the prompt is what the next request can
+        // reuse. The trim is verified by `retain_prefix`, and a failure is
+        // returned to the caller, which clears the context completely.
+        context.retain_prefix(tokens.len())?;
+        *cached_prefix = tokens;
+    } else {
+        context.clear_cache();
+        cached_prefix.clear();
+    }
+
+    Ok(())
+}
+
+/// Clears the context after a failed or panicked generation.
+///
+/// Returns `true` when the context is proven clean. When even the clear panics
+/// the context cannot be trusted any more, so the caller retires the slot
+/// instead of returning it to the free list.
+fn clear_after_failure(
+    context: &mut LlamaContext<'_>,
+    cached_prefix: &mut Vec<i32>,
+    slot: usize,
+) -> bool {
+    cached_prefix.clear();
+
+    match catch_unwind(AssertUnwindSafe(|| context.clear_cache())) {
+        Ok(()) => true,
+        Err(_) => {
+            error!(
+                slot,
+                "the context could not be cleared after a failure; retiring the slot"
+            );
+            false
+        }
     }
 }
 
@@ -574,13 +783,7 @@ mod tests {
         let (commands, _command_receiver) = flume::unbounded::<SlotCommand>();
         let active = Arc::new(AtomicUsize::new(0));
 
-        if release
-            .send(Slot {
-                index: 7,
-                commands,
-            })
-            .is_err()
-        {
+        if release.send(Slot { index: 7, commands }).is_err() {
             panic!("the slot could not be queued");
         }
 
@@ -610,14 +813,7 @@ mod tests {
         let (commands, _command_receiver) = flume::unbounded::<SlotCommand>();
         let active = Arc::new(AtomicUsize::new(0));
 
-        let guard = SlotGuard::new(
-            Slot {
-                index: 0,
-                commands,
-            },
-            release,
-            Arc::clone(&active),
-        );
+        let guard = SlotGuard::new(Slot { index: 0, commands }, release, Arc::clone(&active));
         // `try_acquire` counts the slot as busy before it hands the guard out.
         active.fetch_add(1, Ordering::SeqCst);
 
@@ -628,5 +824,36 @@ mod tests {
         // Only one slot may have been returned.
         assert!(free.try_recv().is_ok());
         assert!(free.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_longest_common_prefix_is_token_wise() {
+        assert_eq!(longest_common_prefix(&[], &[]), 0);
+        assert_eq!(longest_common_prefix(&[1, 2, 3], &[]), 0);
+        assert_eq!(longest_common_prefix(&[], &[1, 2, 3]), 0);
+        assert_eq!(longest_common_prefix(&[1, 2, 3], &[1, 2, 3]), 3);
+        assert_eq!(longest_common_prefix(&[1, 2, 3], &[1, 2]), 2);
+        assert_eq!(longest_common_prefix(&[1, 2], &[1, 2, 3]), 2);
+        assert_eq!(longest_common_prefix(&[1, 2, 3], &[1, 9, 3]), 1);
+        assert_eq!(longest_common_prefix(&[9], &[1]), 0);
+        assert_eq!(longest_common_prefix(&[1, 2, 3], &[1, 2, 4]), 2);
+    }
+
+    #[test]
+    fn a_retired_guard_does_not_return_the_slot() {
+        let (release, free) = flume::unbounded::<Slot>();
+        let (commands, _command_receiver) = flume::unbounded::<SlotCommand>();
+        let active = Arc::new(AtomicUsize::new(0));
+
+        let guard = SlotGuard::new(Slot { index: 3, commands }, release, Arc::clone(&active));
+        active.fetch_add(1, Ordering::SeqCst);
+
+        guard.retire();
+
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(
+            free.try_recv().is_err(),
+            "a poisoned slot was returned to the free list"
+        );
     }
 }

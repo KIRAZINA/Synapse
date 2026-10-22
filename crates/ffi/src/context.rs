@@ -29,6 +29,7 @@ use llama_cpp_2::context::LlamaContext as RawLlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use synapse_core::{StopReason, SynapseError, TokenEvent};
 use tracing::info;
 
@@ -98,16 +99,109 @@ impl<'model> LlamaContext<'model> {
 
     /// Empties the KV cache of the context.
     ///
-    /// A context is reused for many requests by the pool, and the cache still
-    /// holds the tokens of the previous request after a generation. Clearing
-    /// it guarantees that the next request starts from a blank slate and can
-    /// never attend to tokens it did not send.
+    /// This is the `k = 0` case of [`LlamaContext::retain_prefix`]: no token of
+    /// the previous request survives, so the next request starts from a blank
+    /// slate and can never attend to tokens it did not send.
     pub fn clear_cache(&mut self) {
         self.inner.clear_kv_cache();
         tracing::debug!(n_ctx = self.n_ctx, "inference context cache cleared");
     }
 
-    /// Generates up to `max_tokens` tokens for `prompt` and streams them.
+    /// Formats `prompt` with the chat template of the model and tokenizes it.
+    ///
+    /// The returned token IDs are the unit the prefix cache works with: a slot
+    /// remembers the prompt tokens that are resident in its KV cache, and the
+    /// next request can reuse them when the two sequences share a prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the formatted prompt produces no token at all,
+    /// which no generation could serve.
+    pub fn tokenize_prompt(&self, prompt: &str) -> Result<Vec<i32>, SynapseError> {
+        let formatted_prompt = self.model.format_chat_prompt(prompt);
+        let tokens = self
+            .model
+            .vocab()
+            .tokenize(formatted_prompt.as_bytes(), true, true);
+
+        if tokens.is_empty() {
+            return Err(SynapseError::Engine(
+                "the prompt did not produce a single token".to_owned(),
+            ));
+        }
+
+        Ok(tokens.into_iter().map(|token| token.0).collect())
+    }
+
+    /// Keeps the KV cache entries of the first `k` prompt tokens and drops
+    /// everything after them.
+    ///
+    /// The context then logically holds exactly `k` prefilled tokens. The next
+    /// decode has to start at position `k`, which is the caller's job; this
+    /// method only removes the entries.
+    ///
+    /// `k = 0` is [`LlamaContext::clear_cache`] and clears everything.
+    ///
+    /// # Implementation
+    ///
+    /// Positions `[k, end)` are removed with
+    /// `LlamaContext::clear_kv_cache_seq(Some(0), Some(k), None)`, the wrapper
+    /// of `llama_memory_seq_rm(seq 0, k, -1)` of `llama.cpp`. It is the
+    /// supported way to discard a suffix of a sequence without rebuilding the
+    /// prefix in front of it. The call reports `false` when only a partial
+    /// removal was possible, and the position of the last surviving token is
+    /// checked as well: a retained prefix of `k` tokens has to end at `k - 1`.
+    /// Anything else is treated as an error, so the pool can fall back to a
+    /// full clear instead of decoding on top of a KV cache it does not
+    /// understand.
+    pub fn retain_prefix(&mut self, k: usize) -> Result<(), SynapseError> {
+        if k == 0 {
+            self.clear_cache();
+            return Ok(());
+        }
+
+        let boundary = u32::try_from(k).map_err(|_| {
+            SynapseError::Engine(format!(
+                "the cached prefix of {k} tokens does not fit into the KV cache"
+            ))
+        })?;
+
+        let removed = self
+            .inner
+            .clear_kv_cache_seq(Some(0), Some(boundary), None)
+            .map_err(|err| SynapseError::Engine(format!("failed to trim the KV cache: {err}")))?;
+
+        if !removed {
+            return Err(SynapseError::Engine(
+                "llama.cpp could not remove the cached tokens after the prefix".to_owned(),
+            ));
+        }
+
+        let last = self.inner.kv_cache_seq_pos_max(0);
+        if usize::try_from(last).ok() != Some(k - 1) {
+            return Err(SynapseError::Engine(format!(
+                "the KV cache ends at position {last} after retaining {k} tokens"
+            )));
+        }
+
+        tracing::debug!(cached_tokens = k, "KV cache trimmed to the cached prefix");
+        Ok(())
+    }
+
+    /// Prefills `tokens[prefill_from..]` and then generates up to `max_tokens`
+    /// tokens, streaming them.
+    ///
+    /// `tokens` is the complete, already tokenized prompt. The first
+    /// `prefill_from` tokens are expected to be resident in the KV cache
+    /// (see [`LlamaContext::retain_prefix`]); only the remaining prompt tokens
+    /// are evaluated. `prefill_from` therefore has to be lower than
+    /// `tokens.len()`: the logits of the last prompt token are produced by its
+    /// own decode and are not part of the KV cache, so at least that token has
+    /// to be evaluated again even on a full prefix hit.
+    ///
+    /// The prefill and the decode loop are separate and are accounted
+    /// separately: the prefill time is recorded in the `synapse_prefill_ms`
+    /// histogram and logged with the number of evaluated and reused tokens.
     ///
     /// Every sampled token is sent to `token_sender` as a
     /// [`TokenEvent::Token`] before the next one is sampled, so the caller
@@ -121,9 +215,10 @@ impl<'model> LlamaContext<'model> {
     /// The terminal [`TokenEvent::Done`] event is only sent when the
     /// generation ran to completion; a failure is reported as
     /// [`TokenEvent::Error`].
-    pub fn generate_streaming(
+    pub fn prefill_and_generate(
         &mut self,
-        prompt: &str,
+        tokens: &[i32],
+        prefill_from: usize,
         max_tokens: usize,
         token_sender: Sender<TokenEvent>,
     ) -> Result<(), SynapseError> {
@@ -134,16 +229,19 @@ impl<'model> LlamaContext<'model> {
             ));
         }
 
-        let formatted_prompt = self.model.format_chat_prompt(prompt);
-        let tokens = self
-            .model
-            .vocab()
-            .tokenize(formatted_prompt.as_bytes(), true, true);
-
         if tokens.is_empty() {
             return Err(self.fail(
                 &token_sender,
                 "the prompt did not produce a single token".to_owned(),
+            ));
+        }
+
+        if prefill_from >= tokens.len() {
+            return Err(self.fail(
+                &token_sender,
+                format!(
+                    "a cached prefix of {prefill_from} tokens does not leave a prompt token to decode"
+                ),
             ));
         }
 
@@ -159,31 +257,95 @@ impl<'model> LlamaContext<'model> {
             ));
         }
 
-        // The batch holds the whole prompt; the generated tokens are decoded
-        // one at a time afterwards.
-        let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
-        let last_index = (tokens.len() - 1) as i32;
-        for (index, token) in (0_i32..).zip(tokens.iter().copied()) {
-            batch
-                .add(token, index, &[0], index == last_index)
-                .map_err(|err| {
+        // The batch holds only the tokens that are not in the KV cache yet;
+        // the cached prefix keeps its original positions.
+        let prefill_started = Instant::now();
+        let prompt_tokens = tokens.len() - prefill_from;
+        let last_index = tokens.len() - 1;
+
+        // The last prompt token is deliberately *not* batched with the others:
+        // it is the token the first sample is taken from, and a one-token
+        // attention step follows a different code path in `llama.cpp` than a
+        // large prefill batch. Evaluating it alone in both the cold and the
+        // cached case makes the logits, and therefore the output, reproducible
+        // across a cache hit.
+        if prefill_from < last_index {
+            let batched = last_index - prefill_from;
+            let mut batch = LlamaBatch::new(batched, 1);
+
+            for (offset, token) in tokens[prefill_from..last_index].iter().copied().enumerate() {
+                let position = prefill_from + offset;
+                let position_i32 = i32::try_from(position).map_err(|_| {
                     self.fail(
                         &token_sender,
-                        format!("failed to add the prompt token {index} to the batch: {err}"),
+                        format!("the prompt position {position} does not fit into llama.cpp"),
                     )
                 })?;
+                batch
+                    .add(LlamaToken::new(token), position_i32, &[0], false)
+                    .map_err(|err| {
+                        self.fail(
+                            &token_sender,
+                            format!(
+                                "failed to add the prompt token at position {position} to the batch: {err}"
+                            ),
+                        )
+                    })?;
+            }
+
+            self.inner.decode(&mut batch).map_err(|err| {
+                self.fail(&token_sender, format!("failed to decode the prompt: {err}"))
+            })?;
         }
+
+        let mut batch = LlamaBatch::new(1, 1);
+        let last_position = i32::try_from(last_index).map_err(|_| {
+            self.fail(
+                &token_sender,
+                format!("the prompt position {last_index} does not fit into llama.cpp"),
+            )
+        })?;
+        batch
+            .add(
+                LlamaToken::new(tokens[last_index]),
+                last_position,
+                &[0],
+                true,
+            )
+            .map_err(|err| {
+                self.fail(
+                    &token_sender,
+                    format!("failed to add the last prompt token to the batch: {err}"),
+                )
+            })?;
 
         self.inner.decode(&mut batch).map_err(|err| {
             self.fail(&token_sender, format!("failed to decode the prompt: {err}"))
         })?;
+        let prefill_ms = prefill_started.elapsed().as_secs_f64() * 1000.0;
+        metrics::histogram!("synapse_prefill_ms").record(prefill_ms);
+
+        info!(
+            prefill_tokens = prompt_tokens,
+            cached_tokens = prefill_from,
+            prefill_ms,
+            "prompt prefill finished"
+        );
 
         let mut sampler =
             LlamaSampler::chain_simple([LlamaSampler::dist(self.seed), LlamaSampler::greedy()]);
 
         let started = Instant::now();
         let mut n_decoded = 0usize;
-        let mut position = batch.n_tokens();
+        let mut position = i32::try_from(tokens.len()).map_err(|_| {
+            self.fail(
+                &token_sender,
+                format!(
+                    "the prompt length {} does not fit into llama.cpp",
+                    tokens.len()
+                ),
+            )
+        })?;
         let mut time_to_first_token_ms: Option<u64> = None;
         let mut stop_reason = StopReason::MaxTokens;
 
@@ -262,6 +424,9 @@ impl<'model> LlamaContext<'model> {
             elapsed_ms,
             time_to_first_token_ms = time_to_first_token_ms.unwrap_or(0),
             tokens_per_second,
+            prefill_tokens = prompt_tokens,
+            cached_tokens = prefill_from,
+            prefill_ms,
             stop_reason = %stop_reason,
             "streaming generation finished"
         );

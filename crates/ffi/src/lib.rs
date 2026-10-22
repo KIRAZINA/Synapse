@@ -98,6 +98,19 @@ pub fn init_backend() -> Result<&'static LlamaBackend, SynapseError> {
         .unwrap_or(false);
     llama_cpp_2::send_logs_to_tracing(LogOptions::default().with_logs_enabled(logs_enabled));
 
+    // A prefix-cache hit has to produce the same output as a full prefill of
+    // the same prompt. `llama.cpp`'s tiled K-quant matmul picks its K-chunking
+    // from the number of tokens in the batch, so a token evaluated in a large
+    // prefill batch and the same token evaluated in the shorter suffix of a
+    // cache hit can differ in the last bits, which is enough to flip a sample.
+    // The reference path is batch-shape invariant, and on the CPUs measured
+    // here it costs nothing measurable for prefill, while the prefix cache
+    // still makes a repeated prompt roughly 30x cheaper.
+    //
+    // The flag is read once by `ggml` when the first matrix multiplication
+    // runs, so it has to be set before the backend is initialised.
+    disable_tiled_matmul();
+
     let backend = LlamaBackend::init()
         .map_err(|err| SynapseError::Engine(format!("failed to initialise llama.cpp: {err}")))?;
 
@@ -110,6 +123,49 @@ pub fn init_backend() -> Result<&'static LlamaBackend, SynapseError> {
     info!("llama.cpp backend initialised");
 
     BACKEND.get().ok_or_else(|| {
-        SynapseError::Engine("the llama.cpp backend is not initialised after initialising it".to_owned())
+        SynapseError::Engine(
+            "the llama.cpp backend is not initialised after initialising it".to_owned(),
+        )
     })
+}
+
+/// Disables the tiled K-quant matmul of `llama.cpp` (`GGML_CPU_TILED_MM=0`).
+///
+/// The tiled kernel chooses its K-chunking from the number of rows in the
+/// batch, so the same token can be evaluated with a slightly different
+/// floating-point accumulation order in a large prefill batch and in the
+/// shorter suffix of a prefix-cache hit. The reference kernel is invariant to
+/// the batch shape, which is what makes a cache hit byte-identical to a full
+/// prefill. `llama.cpp` reads the variable once, on its first matrix
+/// multiplication, so this has to run before the backend is initialised.
+///
+/// `std::env::set_var` is not enough on Windows: the C runtime keeps its own
+/// copy of the environment and `getenv` in `llama.cpp` does not see the Rust
+/// side, so the value is written through the CRT there.
+fn disable_tiled_matmul() {
+    #[cfg(windows)]
+    {
+        use std::os::raw::c_char;
+
+        extern "C" {
+            /// `_putenv` of the C runtime, which updates the environment that
+            /// `getenv` (and therefore `llama.cpp`) reads.
+            fn _putenv(setting: *const c_char) -> std::os::raw::c_int;
+        }
+
+        // A static, NUL terminated string: `_putenv` may keep the pointer.
+        const SETTING: &[u8] = b"GGML_CPU_TILED_MM=0\0";
+
+        // The pointer is valid for the life of the process.
+        let result = unsafe { _putenv(SETTING.as_ptr().cast()) };
+        if result != 0 {
+            tracing::warn!(
+                "failed to disable the tiled matmul of llama.cpp; prefix-cache hits may not be \
+                 byte-identical to a full prefill"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    std::env::set_var("GGML_CPU_TILED_MM", "0");
 }

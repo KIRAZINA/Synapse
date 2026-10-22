@@ -126,10 +126,9 @@ async fn run() -> Result<()> {
     // background; the node keeps running until it is asked to stop.
     let settings = network_settings(&cli, &config, Arc::clone(&served_models))?;
 
-    let mut network =
-        NetworkNode::new(settings, Arc::clone(&pool) as Arc<dyn TokenStreamProvider>)
-            .await
-            .map_err(|err| anyhow!("failed to start the network node: {err}"))?;
+    let mut network = NetworkNode::new(settings, Arc::clone(&pool) as Arc<dyn TokenStreamProvider>)
+        .await
+        .map_err(|err| anyhow!("failed to start the network node: {err}"))?;
 
     let network_task = tokio::spawn(async move {
         if let Err(err) = network.run().await {
@@ -243,12 +242,14 @@ fn load_pool(config: &Config) -> Result<InferencePool> {
         &model_path.to_string_lossy(),
         config.node.max_capacity,
         config.model.context_length,
+        config.cache.enable_prefix_caching,
     )
     .map_err(|err| anyhow!("failed to load the model '{}': {err}", model_path.display()))?;
 
     info!(
         model = %config.model.name,
         path = %model_path.display(),
+        prefix_caching = config.cache.enable_prefix_caching,
         "model loaded successfully"
     );
 
@@ -310,15 +311,26 @@ fn start_metrics_exporter(port: u16) {
     let address = SocketAddr::from(([0, 0, 0, 0], port));
 
     // A true Prometheus histogram needs bucket bounds. Without them the
-    // exporter renders histograms as summaries.
-    const TTFT_BUCKETS_MS: [f64; 13] = [
+    // exporter renders histograms as summaries. TTFT and prefill latency use
+    // the same scale.
+    const LATENCY_BUCKETS_MS: [f64; 13] = [
         1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
     ];
 
     let builder = PrometheusBuilder::new().with_http_listener(address);
     let builder = match builder.set_buckets_for_metric(
         Matcher::Full("synapse_ttft_ms".to_owned()),
-        &TTFT_BUCKETS_MS,
+        &LATENCY_BUCKETS_MS,
+    ) {
+        Ok(builder) => builder,
+        Err(err) => {
+            error!("the prometheus exporter could not be configured: {err}");
+            return;
+        }
+    };
+    let builder = match builder.set_buckets_for_metric(
+        Matcher::Full("synapse_prefill_ms".to_owned()),
+        &LATENCY_BUCKETS_MS,
     ) {
         Ok(builder) => builder,
         Err(err) => {

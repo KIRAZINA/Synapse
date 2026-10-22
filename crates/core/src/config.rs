@@ -84,6 +84,15 @@ enabled = true
 # The port of the metrics listener.
 port = 9090
 
+[cache]
+# Reuse the KV cache of a slot for the prefix that a new prompt shares with the
+# previous request of that slot. Prefill is the most expensive part of serving,
+# so a shared system prompt is only evaluated once per slot instead of once per
+# request. A hit never changes the output: the reused tokens are exactly the
+# ones the model would evaluate again. Set this to false to clear the KV cache
+# after every generation, which is the pre-caching behaviour.
+enable_prefix_caching = true
+
 [bootstrap]
 # Multiaddrs of the peers that are dialed at start up.
 peers = []
@@ -150,6 +159,8 @@ pub struct Config {
     pub quic: QuicConfig,
     /// The Prometheus exporter.
     pub metrics: MetricsConfig,
+    /// The prompt prefix cache of the inference slots.
+    pub cache: CacheConfig,
     /// The peers that are dialed at start up.
     pub bootstrap: BootstrapConfig,
 }
@@ -260,8 +271,8 @@ impl Config {
         // exact size depends on the model, so this is a deliberately
         // conservative warning based on the configured window; the engine logs
         // the precise estimate from the model metadata at startup.
-        let token_slots = u64::from(self.node.max_capacity)
-            .saturating_mul(u64::from(self.model.context_length));
+        let token_slots =
+            u64::from(self.node.max_capacity).saturating_mul(u64::from(self.model.context_length));
         let estimated_kv_bytes = token_slots.saturating_mul(CONSERVATIVE_KV_BYTES_PER_TOKEN);
 
         if estimated_kv_bytes > KV_CACHE_WARN_BYTES {
@@ -361,6 +372,30 @@ impl Default for MetricsConfig {
     }
 }
 
+/// The prompt prefix cache of the inference slots.
+///
+/// The cache is per slot and holds at most one prefix: the prompt tokens of
+/// the previous request that are still in the KV cache. It is not shared
+/// between slots and it has no eviction policy; a miss simply prefills the
+/// whole prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Whether a slot may reuse the prompt prefix that is in its KV cache.
+    ///
+    /// When this is `false`, every generation starts from an empty KV cache,
+    /// exactly like before prefix caching existed.
+    pub enable_prefix_caching: bool,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enable_prefix_caching: true,
+        }
+    }
+}
+
 /// The peers that are dialed at start up.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -368,7 +403,6 @@ pub struct BootstrapConfig {
     /// The multiaddrs of the bootstrap peers.
     pub peers: Vec<String>,
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,8 +423,18 @@ mod tests {
         assert_eq!(config.quic.keep_alive_interval_ms, 5_000);
         assert!(config.metrics.enabled);
         assert_eq!(config.metrics.port, 9090);
+        assert!(config.cache.enable_prefix_caching);
         assert!(config.bootstrap.peers.is_empty());
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn prefix_caching_can_be_disabled() {
+        let config = Config::from_toml_str("[cache]\nenable_prefix_caching = false\n")
+            .unwrap_or_else(|err| panic!("the cache section does not parse: {err}"));
+
+        assert!(!config.cache.enable_prefix_caching);
+        assert_eq!(config.node, Config::default().node);
     }
 
     #[test]
@@ -465,9 +509,8 @@ mod tests {
         // host has memory for. That is worth a warning, but it is not the
         // configuration parser's job to decide how much memory the operator
         // has: the node starts and the engine reports the real estimate.
-        let config = Config::from_toml_str(
-            "[node]\nmax_capacity = 64\n\n[model]\ncontext_length = 8192\n",
-        );
+        let config =
+            Config::from_toml_str("[node]\nmax_capacity = 64\n\n[model]\ncontext_length = 8192\n");
 
         let config = match config {
             Ok(config) => config,
