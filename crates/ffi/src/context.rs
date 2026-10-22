@@ -37,6 +37,23 @@ use crate::model::LlamaModel;
 /// Default seed used by the sampler, kept fixed so that runs are reproducible.
 const DEFAULT_SEED: u32 = 1234;
 
+/// Keeps the active-generation gauge balanced, even when generation fails or
+/// the client disconnects half way through.
+struct ActiveGeneration;
+
+impl ActiveGeneration {
+    fn start() -> Self {
+        metrics::gauge!("synapse_active_generations").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for ActiveGeneration {
+    fn drop(&mut self) {
+        metrics::gauge!("synapse_active_generations").decrement(1.0);
+    }
+}
+
 /// An inference context that borrows the model it was created from.
 ///
 /// # Ownership
@@ -148,6 +165,10 @@ impl<'model> LlamaContext<'model> {
             ));
         }
 
+        // From here on the model is actually working, so the generation counts
+        // as active. The guard decrements the gauge on every exit path.
+        let _active_generation = ActiveGeneration::start();
+
         // The batch holds the whole prompt; the generated tokens are decoded
         // one at a time afterwards.
         let mut batch = LlamaBatch::new(tokens.len().max(1), 1);
@@ -212,8 +233,12 @@ impl<'model> LlamaContext<'model> {
                 return Ok(());
             }
 
+            metrics::counter!("synapse_tokens_generated_total").increment(1);
+
             if time_to_first_token_ms.is_none() {
-                time_to_first_token_ms = Some(started.elapsed().as_millis() as u64);
+                let ttft_ms = started.elapsed().as_millis() as u64;
+                time_to_first_token_ms = Some(ttft_ms);
+                metrics::histogram!("synapse_ttft_ms").record(ttft_ms as f64);
             }
 
             batch.clear();

@@ -12,6 +12,7 @@ synapse-core.workspace = true
 synapse-net.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+flume.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

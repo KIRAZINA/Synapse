@@ -7,6 +7,7 @@
 //! the async side never blocks on the inference engine.
 
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -22,6 +23,12 @@ const DEFAULT_CONTEXT_SIZE: u32 = 2048;
 
 /// Fallback number of threads when the parallelism of the host is unknown.
 const DEFAULT_THREADS: i32 = 4;
+
+/// The number of generations a node runs in parallel.
+///
+/// The actor processes the generations one after the other on its own
+/// thread, so the capacity of a node is one.
+const MAX_CONCURRENT_GENERATIONS: u32 = 1;
 
 /// Commands accepted by the inference actor.
 #[derive(Debug)]
@@ -51,6 +58,8 @@ pub enum EngineCommand {
 pub struct InferenceActor {
     sender: Sender<EngineCommand>,
     handle: Option<thread::JoinHandle<()>>,
+    /// The number of generations that are currently running.
+    active: Arc<AtomicU32>,
 }
 
 impl InferenceActor {
@@ -61,20 +70,27 @@ impl InferenceActor {
     pub fn spawn() -> Self {
         let (sender, receiver) = flume::unbounded::<EngineCommand>();
 
+        // The counter of the running generations is shared with the telemetry
+        // of the node, which is published from another thread.
+        let active = Arc::new(AtomicU32::new(0));
+        let thread_active = Arc::clone(&active);
+
         let handle = thread::Builder::new()
             .name("synapse-inference-actor".to_string())
-            .spawn(move || run_actor(receiver));
+            .spawn(move || run_actor(receiver, thread_active));
 
         match handle {
             Ok(handle) => Self {
                 sender,
                 handle: Some(handle),
+                active,
             },
             Err(err) => {
                 error!("failed to spawn inference actor thread: {err}");
                 Self {
                     sender,
                     handle: None,
+                    active,
                 }
             }
         }
@@ -143,7 +159,11 @@ impl InferenceActor {
 
     /// Requests a graceful shutdown and waits for the actor thread to exit.
     pub fn shutdown(self) -> Result<(), SynapseError> {
-        let Self { sender, handle } = self;
+        let Self {
+            sender,
+            handle,
+            active: _,
+        } = self;
 
         sender.send(EngineCommand::Shutdown).map_err(|err| {
             SynapseError::Engine(format!("inference actor channel is closed: {err}"))
@@ -175,10 +195,18 @@ impl TokenStreamProvider for InferenceActor {
 
         Ok(token_receiver)
     }
+
+    fn active_requests(&self) -> u32 {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    fn max_capacity(&self) -> u32 {
+        MAX_CONCURRENT_GENERATIONS
+    }
 }
 
 /// Body of the actor thread: the command loop.
-fn run_actor(receiver: Receiver<EngineCommand>) {
+fn run_actor(receiver: Receiver<EngineCommand>, active_generations: Arc<AtomicU32>) {
     info!("inference actor thread started");
 
     let backend = match synapse_ffi::init_backend() {
@@ -213,6 +241,10 @@ fn run_actor(receiver: Receiver<EngineCommand>) {
                 max_tokens,
                 token_sender,
             }) => {
+                // The generation is counted while it runs, so that the
+                // telemetry of the node tells the clients how busy it is.
+                active_generations.fetch_add(1, Ordering::Relaxed);
+
                 let result = generate_streaming(
                     model.as_ref(),
                     backend.as_ref(),
@@ -224,6 +256,8 @@ fn run_actor(receiver: Receiver<EngineCommand>) {
                 if let Err(err) = &result {
                     error!("generation failed: {err}");
                 }
+
+                active_generations.fetch_sub(1, Ordering::Relaxed);
             }
             Ok(EngineCommand::Shutdown) => {
                 info!("inference actor received shutdown command");

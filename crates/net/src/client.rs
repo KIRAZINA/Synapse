@@ -1,4 +1,10 @@
 //! The QUIC client that requests a generation from a remote node.
+//!
+//! The client uses the same transport settings as the server (see
+//! [`crate::transport`]): a keep-alive every five seconds holds the connection
+//! open while the first token of a long generation is still being computed, and
+//! a ten second idle timeout makes the client notice a node that died instead
+//! of waiting for it forever.
 
 use std::net::SocketAddr;
 
@@ -49,6 +55,8 @@ impl RemoteInferenceClient {
     /// plane; it is pinned, so the connection is only accepted when the
     /// remote node owns the matching private key.
     pub fn new(addr: SocketAddr, cert_der: Vec<u8>) -> Result<Self, SynapseError> {
+        crate::transport::install_crypto_provider();
+
         let bind_addr: SocketAddr = ([0, 0, 0, 0], 0).into();
         let endpoint = Endpoint::client(bind_addr).map_err(|err| {
             SynapseError::Network(format!("failed to create the quic endpoint: {err}"))

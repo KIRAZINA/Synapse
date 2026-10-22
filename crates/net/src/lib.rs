@@ -14,6 +14,7 @@
 
 pub mod client;
 pub mod discovery;
+pub mod routing;
 pub mod server;
 pub mod transport;
 pub mod wire;
@@ -21,21 +22,30 @@ pub mod wire;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{identity, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
-use synapse_core::{SynapseError, TokenStreamProvider};
-use tracing::{info, warn};
+use synapse_core::{NodeTelemetry, SynapseError, TokenStreamProvider};
+use tracing::{debug, info, warn};
 
 use crate::discovery::{
-    HandshakeRequest, HandshakeResponse, SynapseBehaviour, SynapseBehaviourEvent,
+    telemetry_request_topic, telemetry_topic, HandshakeRequest, HandshakeResponse, SynapseBehaviour,
+    SynapseBehaviourEvent, TELEMETRY_REQUEST_PAYLOAD,
 };
+use crate::routing::{encode_telemetry, now_ms, RoutingTable};
 use crate::server::InferenceServer;
 use crate::transport::QuicTransport;
 
 pub use libp2p::Multiaddr as PeerMultiaddr;
+
+/// How often the telemetry of a node is broadcast.
+pub const TELEMETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The models a node of this build is able to serve.
+pub const SUPPORTED_MODELS: [&str; 1] = ["tinyllama-1.1b"];
 
 /// The multiaddr the control plane listens on.
 const LISTEN_ADDRESS: &str = "/ip4/0.0.0.0/tcp/0";
@@ -48,6 +58,8 @@ pub struct NetworkNode {
     quic: QuicTransport,
     /// The provider that serves the generation requests of the peers.
     provider: Arc<dyn TokenStreamProvider>,
+    /// The telemetry of the known peers.
+    routing: Arc<RoutingTable>,
     /// The identity of this node.
     peer_id: PeerId,
     /// The node that is dialed on start up, if any.
@@ -96,6 +108,7 @@ impl NetworkNode {
             swarm,
             quic,
             provider,
+            routing: Arc::new(RoutingTable::new()),
             peer_id,
             bootstrap,
             peer_addresses: HashMap::new(),
@@ -116,6 +129,12 @@ impl NetworkNode {
     pub fn provider(&self) -> &Arc<dyn TokenStreamProvider> {
         &self.provider
     }
+
+    /// The telemetry of the known peers.
+    pub fn routing(&self) -> &Arc<RoutingTable> {
+        &self.routing
+    }
+
     /// The addresses the control plane is listening on.
     pub fn listen_addresses(&self) -> Vec<Multiaddr> {
         self.swarm.listeners().cloned().collect()
@@ -131,7 +150,28 @@ impl NetworkNode {
             .map_err(|err| SynapseError::Network(format!("failed to listen: {err}")))?;
 
         if let Some(bootstrap) = self.bootstrap.clone() {
+            discovery::register_bootstrap(&mut self.swarm, &bootstrap);
             discovery::dial_bootstrap(&mut self.swarm, &bootstrap);
+
+            if let Err(err) = self.swarm.behaviour_mut().kad.bootstrap() {
+                debug!("kademlia bootstrap is not possible yet: {err}");
+            }
+
+            let local_peer_id = *self.swarm.local_peer_id();
+            let _ = self
+                .swarm
+                .behaviour_mut()
+                .kad
+                .get_closest_peers(local_peer_id);
+        }
+
+        // The node joins the telemetry topic, so that the clients can see how
+        // busy it is, and the refresh topic, so that it can answer a client
+        // that joins the mesh.
+        for topic in [telemetry_topic(), telemetry_request_topic()] {
+            if let Err(err) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+                warn!(%topic, "failed to subscribe to a telemetry topic: {err}");
+            }
         }
 
         // The data plane runs in its own task: the swarm loop must never be
@@ -142,9 +182,84 @@ impl NetworkNode {
             server.run().await;
         });
 
+        let mut telemetry_tick = tokio::time::interval(TELEMETRY_INTERVAL);
+        telemetry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
-            let event = self.swarm.select_next_some().await;
-            self.handle_event(event).await;
+            tokio::select! {
+                event = self.swarm.select_next_some() => {
+                    self.handle_event(event).await;
+                }
+                _ = telemetry_tick.tick() => {
+                    self.publish_telemetry();
+                    self.routing.remove_stale();
+                }
+            }
+        }
+    }
+
+    /// Broadcasts the telemetry of this node.
+    fn publish_telemetry(&mut self) {
+        // The listener is bound to `0.0.0.0`, which is not a destination.
+        // Advertise the address of the interface that the default route uses.
+        let addresses = self
+            .swarm
+            .listeners()
+            .map(discovery::advertised_address)
+            .map(|address| address.to_string())
+            .collect();
+
+        let telemetry = NodeTelemetry {
+            peer_id: self.peer_id.to_base58(),
+            quic_port: self.quic.local_port(),
+            addresses,
+            active_requests: self.provider.active_requests(),
+            max_capacity: self.provider.max_capacity(),
+            supported_models: SUPPORTED_MODELS.iter().map(|m| (*m).to_owned()).collect(),
+            timestamp_ms: now_ms(),
+        };
+
+        let payload = match encode_telemetry(&telemetry) {
+            Ok(payload) => payload,
+            Err(err) => {
+                warn!("{err}");
+                return;
+            }
+        };
+
+        // `publish` only queues the message on the swarm; the event loop is
+        // never blocked by the network.
+        match self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(telemetry_topic(), payload)
+        {
+            Ok(_) => {
+                info!(
+                    active_requests = telemetry.active_requests,
+                    max_capacity = telemetry.max_capacity,
+                    "telemetry published"
+                );
+            }
+            Err(err) => {
+                // A node without peers in the mesh has nobody to gossip to.
+                debug!("failed to publish the telemetry: {err}");
+            }
+        }
+    }
+
+    /// Asks every node in the mesh to publish its telemetry right away.
+    fn request_telemetry(&mut self) {
+        match self.swarm.behaviour_mut().gossipsub.publish(
+            telemetry_request_topic(),
+            TELEMETRY_REQUEST_PAYLOAD.to_vec(),
+        ) {
+            Ok(_) => debug!("requested an immediate telemetry broadcast"),
+            Err(err) => {
+                // A node without peers in the mesh has nobody to ask.
+                debug!("failed to request the telemetry: {err}");
+            }
         }
     }
 
@@ -157,10 +272,21 @@ impl NetworkNode {
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
-                let remote = endpoint.get_remote_address();
-                if let Some(ip) = discovery::ip_from_multiaddr(remote) {
+                let remote = endpoint.get_remote_address().clone();
+                if let Some(ip) = discovery::ip_from_multiaddr(&remote) {
                     self.peer_addresses.insert(peer_id, SocketAddr::new(ip, 0));
                 }
+
+                // Kademlia learns the real address of the peer from the
+                // connection, not only from the wildcard listen address.
+                let address = discovery::strip_p2p(&remote);
+                if !address.is_empty() {
+                    self.swarm
+                        .behaviour_mut()
+                        .kad
+                        .add_address(&peer_id, address);
+                }
+
                 info!(%peer_id, %remote, "libp2p connection established");
                 self.request_handshake(peer_id);
             }
@@ -214,13 +340,104 @@ impl NetworkNode {
                     self.connect_quic(peer, response);
                 }
             },
-            SynapseBehaviourEvent::Kad(event) => discovery::log_routing_update(&event),
+            SynapseBehaviourEvent::Kad(event) => {
+                match &event {
+                    libp2p::kad::Event::RoutablePeer { peer, address }
+                    | libp2p::kad::Event::PendingRoutablePeer { peer, address } => {
+                        if let Some(ip) = discovery::ip_from_multiaddr(address) {
+                            self.peer_addresses
+                                .entry(*peer)
+                                .or_insert(SocketAddr::new(ip, 0));
+                        }
+                    }
+                    libp2p::kad::Event::RoutingUpdated { peer, addresses, .. } => {
+                        if let Some(ip) =
+                            addresses.iter().find_map(discovery::ip_from_multiaddr)
+                        {
+                            self.peer_addresses
+                                .entry(*peer)
+                                .or_insert(SocketAddr::new(ip, 0));
+                        }
+                    }
+                    _ => {}
+                }
+                discovery::log_routing_update(&event);
+            }
+            SynapseBehaviourEvent::Gossipsub(event) => {
+                match event {
+                    libp2p::gossipsub::Event::Message { message, .. } => {
+                        if message.topic == telemetry_request_topic().hash() {
+                            if message.data.as_slice() == TELEMETRY_REQUEST_PAYLOAD {
+                                // A client joined: answer immediately.
+                                self.publish_telemetry();
+                            } else {
+                                debug!("ignoring a malformed telemetry refresh request");
+                            }
+                            return;
+                        }
+
+                        if message.topic != telemetry_topic().hash() {
+                            return;
+                        }
+
+                        let Some(peer) = message.source else {
+                            debug!("ignoring an unsigned telemetry message");
+                            return;
+                        };
+
+                        match self.routing.ingest(peer, &message.data) {
+                            Ok(telemetry) => {
+                                info!(
+                                    %peer,
+                                    active_requests = telemetry.active_requests,
+                                    max_capacity = telemetry.max_capacity,
+                                    "received the telemetry of a peer"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(%peer, "ignoring a malformed telemetry message: {err}");
+                            }
+                        }
+                    }
+                    libp2p::gossipsub::Event::Subscribed { peer_id, topic } => {
+                        if topic != telemetry_topic().hash() {
+                            debug!(%peer_id, %topic, "a peer joined another telemetry topic");
+                            return;
+                        }
+
+                        info!(%peer_id, %topic, "a peer joined the telemetry topic");
+                        // Publish right away and ask every other node to do
+                        // the same, so that a client that just joined does not
+                        // have to wait for the next five second tick of each
+                        // node.
+                        self.publish_telemetry();
+                        self.request_telemetry();
+                    }
+                    _ => {}
+                }
+            }
             SynapseBehaviourEvent::Identify(libp2p::identify::Event::Received {
                 peer_id,
                 info,
                 ..
             }) => {
-                info!(%peer_id, addresses = ?info.listen_addrs, "identified peer");
+                for address in info.listen_addrs {
+                    let address = discovery::strip_p2p(&address);
+                    if let Some(ip) = discovery::ip_from_multiaddr(&address) {
+                        if !ip.is_unspecified() {
+                            self.peer_addresses
+                                .entry(peer_id)
+                                .or_insert(SocketAddr::new(ip, 0));
+                        }
+                    }
+                    if !address.is_empty() {
+                        self.swarm
+                            .behaviour_mut()
+                            .kad
+                            .add_address(&peer_id, address);
+                    }
+                }
+                info!(%peer_id, "identified peer");
             }
             _ => {}
         }

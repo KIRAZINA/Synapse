@@ -1,12 +1,14 @@
 //! Synapse node daemon entry point.
 
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use synapse_core::TokenEvent;
 use synapse_engine::actor::InferenceActor;
 use synapse_net::client::RemoteInferenceClient;
@@ -22,6 +24,9 @@ const DEMO_PROMPT: &str = "Hello, I am Synapse. Tell me a short joke about distr
 
 /// Number of tokens generated for the demo prompt.
 const DEMO_MAX_TOKENS: usize = 50;
+
+/// The port the Prometheus exporter listens on.
+const DEFAULT_METRICS_PORT: u16 = 9090;
 
 /// Command line arguments of the node.
 #[derive(Debug, Parser)]
@@ -42,6 +47,10 @@ struct Cli {
     /// Number of tokens that are requested from the remote node.
     #[arg(long, default_value_t = 50, value_name = "COUNT")]
     max_tokens: u32,
+
+    /// Port of the Prometheus exporter.
+    #[arg(long, default_value_t = DEFAULT_METRICS_PORT, value_name = "PORT")]
+    metrics_port: u16,
 }
 
 #[tokio::main]
@@ -49,6 +58,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(true).init();
 
     let cli = Cli::parse();
+
+    // The Prometheus exporter is isolated: a busy port or a broken exporter
+    // must never take the node down.
+    start_metrics_exporter(cli.metrics_port);
 
     // The Ctrl+C handler is installed right away: Tokio only registers it
     // when the future is polled for the first time, and until then the
@@ -150,6 +163,38 @@ async fn main() -> Result<()> {
 
     info!("Synapse Node stopped gracefully");
     Ok(())
+}
+
+/// Starts the Prometheus exporter.
+///
+/// The exporter runs in the background and serves the metrics on
+/// `http://<host>:<port>/metrics`. A failure is logged, the node keeps
+/// running without the exporter.
+fn start_metrics_exporter(port: u16) {
+    let address = SocketAddr::from(([0, 0, 0, 0], port));
+
+    // A true Prometheus histogram needs bucket bounds. Without them the
+    // exporter renders histograms as summaries.
+    const TTFT_BUCKETS_MS: [f64; 13] = [
+        1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
+    ];
+
+    let builder = PrometheusBuilder::new().with_http_listener(address);
+    let builder = match builder.set_buckets_for_metric(
+        Matcher::Full("synapse_ttft_ms".to_owned()),
+        &TTFT_BUCKETS_MS,
+    ) {
+        Ok(builder) => builder,
+        Err(err) => {
+            error!("the prometheus exporter could not be configured: {err}");
+            return;
+        }
+    };
+
+    match builder.install() {
+        Ok(()) => info!(%address, "the prometheus exporter is serving /metrics"),
+        Err(err) => error!("the prometheus exporter could not be started: {err}"),
+    }
 }
 
 /// Forwards a prompt to a remote node and prints the answer.

@@ -56,3 +56,9 @@ rustls = { version = "0.23", default-features = false, features = [
 rcgen = "0.14"
 serde = { version = "1", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Telemetry and observability.
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+dashmap = "6"
+bincode = { version = "2", features = ["serde"] }

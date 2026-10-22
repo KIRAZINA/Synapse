@@ -13,4 +13,5 @@ synapse-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 flume.workspace = true
+metrics.workspace = true
 llama-cpp-2 = { workspace = true }

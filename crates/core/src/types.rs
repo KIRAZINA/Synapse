@@ -1,5 +1,6 @@
 //! Fundamental data types and the shared error taxonomy.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Errors surfaced across the whole Synapse workspace.
@@ -60,6 +61,32 @@ impl std::fmt::Display for StopReason {
     }
 }
 
+/// The telemetry a node broadcasts about itself.
+///
+/// The payload is gossiped over the control plane, so that the clients can
+/// pick a node that is neither busy nor dead.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NodeTelemetry {
+    /// The libp2p peer id of the node.
+    pub peer_id: String,
+    /// The UDP port of the QUIC endpoint of the node.
+    pub quic_port: u16,
+    /// The libp2p addresses of the node, as multiaddr strings.
+    ///
+    /// They are part of the telemetry because a client has to be able to
+    /// reach the node it selected, and the gossip does not carry the
+    /// multiaddrs of the other peers.
+    pub addresses: Vec<String>,
+    /// The number of generations that are currently running.
+    pub active_requests: u32,
+    /// The number of generations the node accepts in parallel.
+    pub max_capacity: u32,
+    /// The models the node is able to serve.
+    pub supported_models: Vec<String>,
+    /// The time the telemetry was created, in unix milliseconds.
+    pub timestamp_ms: u64,
+}
+
 /// A provider of streaming inference.
 ///
 /// The networking layer depends on this trait instead of on the inference
@@ -75,6 +102,12 @@ pub trait TokenStreamProvider: Send + Sync + 'static {
         prompt: String,
         max_tokens: usize,
     ) -> Result<flume::Receiver<TokenEvent>, SynapseError>;
+
+    /// The number of generations that are currently running.
+    fn active_requests(&self) -> u32;
+
+    /// The number of generations the node accepts in parallel.
+    fn max_capacity(&self) -> u32;
 }
 
 /// A single inference request handed to the engine.

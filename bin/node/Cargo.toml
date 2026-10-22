@@ -18,6 +18,5 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 flume.workspace = true
-
-
-
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true

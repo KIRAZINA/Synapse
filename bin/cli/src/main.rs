@@ -1,14 +1,17 @@
 //! Synapse command line client entry point.
 
 use std::io::Write;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use synapse_core::TokenEvent;
-use synapse_net::client::RemoteInferenceClient;
-use synapse_net::discovery::{fetch_quic_info, parse_bootstrap};
+use synapse_net::client::{AbortHandle, RemoteInferenceClient};
+use synapse_net::discovery::{collect_telemetry, fetch_quic_info, parse_bootstrap};
 use tracing::{error, info};
+
+/// How long the client listens to the gossiped telemetry.
+const DISCOVERY_WINDOW: Duration = Duration::from_secs(3);
 
 /// Command line arguments of the client.
 #[derive(Debug, Parser)]
@@ -34,6 +37,11 @@ enum Command {
         /// Multiaddr of the node that runs the generation.
         #[arg(long, value_name = "MULTIADDR")]
         remote: Option<String>,
+
+        /// Discover a node with the gossiped telemetry and send the prompt to
+        /// the least loaded one.
+        #[arg(long)]
+        discover: bool,
 
         /// Number of tokens that are requested.
         #[arg(long, default_value_t = 50, value_name = "COUNT")]
@@ -61,15 +69,25 @@ async fn main() -> Result<()> {
         Some(Command::Chat {
             prompt,
             remote,
+            discover,
             max_tokens,
-        }) => match remote.as_deref() {
-            Some(target) => {
-                chat_remote(target, &prompt, max_tokens, shutdown_receiver).await?;
+        }) => {
+            if discover {
+                let bootstrap = cli.bootstrap.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--discover needs a --bootstrap multiaddr to join the mesh")
+                })?;
+                chat_discover(bootstrap, &prompt, max_tokens, shutdown_receiver).await?;
+            } else {
+                match remote.as_deref() {
+                    Some(target) => {
+                        chat_remote(target, &prompt, max_tokens, shutdown_receiver).await?;
+                    }
+                    None => {
+                        println!("prompt: {prompt}");
+                    }
+                }
             }
-            None => {
-                println!("prompt: {prompt}");
-            }
-        },
+        }
         None => match cli.bootstrap.as_deref() {
             Some(address) => {
                 println!("bootstrap: {address}");
@@ -81,6 +99,47 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Finds the least loaded node of the mesh and runs the generation there.
+async fn chat_discover(
+    bootstrap: &str,
+    prompt: &str,
+    max_tokens: u32,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    let bootstrap = parse_bootstrap(bootstrap)?;
+
+    info!(%bootstrap, "joining the telemetry mesh");
+    let discovery = collect_telemetry(&bootstrap, DISCOVERY_WINDOW).await?;
+
+    info!(
+        peers = discovery.len(),
+        "the routing table holds the telemetry of the known peers"
+    );
+
+    let best = discovery.best_peer().ok_or_else(|| {
+        anyhow::anyhow!("no peer with free capacity was found in the routing table")
+    })?;
+
+    info!(
+        peer_id = %best.peer_id,
+        active_requests = best.active_requests,
+        max_capacity = best.max_capacity,
+        "selected the least loaded peer"
+    );
+
+    let address = discovery.address_of(&best).ok_or_else(|| {
+        anyhow::anyhow!("the selected peer did not publish a reachable address")
+    })?;
+
+    info!(%address, "requesting the quic endpoint of the selected peer");
+    let (addr, cert_der) = fetch_quic_info(&address).await?;
+
+    let client = RemoteInferenceClient::new(addr, cert_der)?;
+    let (events, abort) = client.generate(prompt.to_owned(), max_tokens).await?;
+
+    print_events(events, abort, &mut shutdown).await
 }
 
 /// Runs a generation on a remote node and prints the answer as it arrives.
@@ -98,6 +157,15 @@ async fn chat_remote(
     let client = RemoteInferenceClient::new(addr, cert_der)?;
     let (events, abort) = client.generate(prompt.to_owned(), max_tokens).await?;
 
+    print_events(events, abort, &mut shutdown).await
+}
+
+/// Prints the events of a generation until it is done.
+async fn print_events(
+    events: flume::Receiver<TokenEvent>,
+    abort: AbortHandle,
+    shutdown: &mut tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
     let request_started = Instant::now();
     let mut stdout = std::io::stdout();
     let mut first_token_at: Option<Instant> = None;
@@ -143,7 +211,7 @@ async fn chat_remote(
                     }
                 }
             }
-            _ = &mut shutdown => {
+            _ = &mut *shutdown => {
                 // The abort resets the stream, so the remote node stops
                 // generating right away.
                 abort.abort();
