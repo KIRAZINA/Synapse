@@ -92,6 +92,13 @@ cross-slot sharing, no radix tree, no eviction and no sticky routing), and any
 error, failed trim or panic falls back to a full `clear_cache()` and a prefill
 from zero.
 
+With `cache.enable_affinity_scheduling = true` (the default), the pool
+tokenizes the prompt before it takes a slot and picks the *free* slot whose
+cached prefix has the longest common token prefix with the incoming prompt.
+Affinity is opportunistic: a busy slot is never waited for, and a full pool is
+still rejected immediately. Set it to `false` for the Phase 8 behaviour of
+taking the oldest free slot.
+
 To keep a hit byte-identical to a full prefill, the engine disables
 `llama.cpp`'s tiled K-quant matmul (`GGML_CPU_TILED_MM=0`). That kernel picks
 its K-chunking from the number of tokens in the batch, which changes the last
@@ -100,8 +107,25 @@ The reference kernel is batch-shape invariant; on the CPUs measured here it
 costs nothing measurable for prefill, while the cache still makes a repeated
 prompt roughly 30x cheaper.
 
+This byte identity is a deliberate trade-off rather than a correctness
+requirement. Production inference is correct with either kernel: the tiled
+matmul only changes floating-point accumulation order. Byte identity is a very
+useful *test* invariant, because it lets the cache tests compare a hit against a
+full prefill exactly instead of within a tolerance, and the reference kernel is
+currently free. The environment variable is written exactly once, through
+`_putenv` on Windows and `std::env::set_var` elsewhere, while
+`init_backend` holds its process-wide initialisation lock. That happens before
+the backend exists and before any slot thread or inference context is spawned,
+and `llama.cpp` reads the variable on its first matrix multiplication, so no
+generation can race the write. If large models or large batches later show a
+real gain from the tiled kernel, the honest escape hatch would be a
+`[cache] deterministic = false` option; byte identity would then become a
+test-only mode. It is intentionally not configurable today, so that the
+byte-identical invariant stays unconditional.
+
 Set `cache.enable_prefix_caching = false` to clear the KV cache after every
-generation, which is the behaviour from before the cache existed.
+generation, which is the behaviour from before the cache existed. Affinity is
+disabled together with the cache, because there is no prefix to match.
 
 ## Configuration
 
@@ -129,6 +153,7 @@ port = 9090
 
 [cache]
 enable_prefix_caching = true
+enable_affinity_scheduling = true
 
 [bootstrap]
 peers = []
@@ -142,17 +167,28 @@ peers = []
 | --- | --- | --- |
 | `synapse_active_generations` | gauge | Slots that are currently serving |
 | `synapse_capacity_total` | gauge | Slots the pool was created with |
+| `synapse_capacity_live` | gauge | Live slots that are not retired (what telemetry advertises) |
+| `synapse_slots_retired_total` | counter | Slots permanently taken out of service |
 | `synapse_tokens_generated_total` | counter | Sampled tokens |
 | `synapse_ttft_ms` | histogram | Time from the end of prefill to the first token |
 | `synapse_prefill_ms` | histogram | Prompt prefill time, measured separately from decode |
 | `synapse_prefix_cache_requests_total` | counter | Requests served with prefix caching enabled |
 | `synapse_prefix_cache_hits_total` | counter | Requests that reused at least one prompt token |
 | `synapse_prefill_tokens_saved_total` | counter | Prompt tokens skipped through the cache |
+| `synapse_slot_affinity_matches_total` | counter | Selections of a free slot with a non-empty cached-prefix match |
 
 Derive the hit rate from `synapse_prefix_cache_hits_total /
 synapse_prefix_cache_requests_total`. The saved-token counter is the direct
 measure of prefill work that was avoided; it says nothing about decode time,
-which is not affected by the cache.
+which is not affected by the cache. A full hit saves `prompt_tokens - 1` tokens:
+the last prompt token is always evaluated again because its logits are what
+sampling continues from. A saving that is consistently lower than that is a
+partial prefix match, not a missed or double-counted full match.
+
+`synapse_capacity_total` is the configured capacity. `synapse_capacity_live`
+drops when a slot is retired, and the same live number is what
+`max_capacity` — and therefore `NodeTelemetry.max_capacity` — reports to the
+router. A node never advertises capacity it has lost.
 
 ## Tests
 
@@ -162,4 +198,7 @@ cargo test --workspace
 
 The model-backed pool tests skip themselves when the GGUF file is absent. They
 cover real concurrency, capacity rejection, disconnects, reuse after a panic,
-and byte-identical output for cold, partial and full prefix hits.
+byte-identical output for cold, partial and full prefix hits, the live-capacity
+drop when a slot is retired, and the A, A, B, A affinity comparison at
+capacity 2. That comparison prints the hit count, saved tokens and affinity
+matches for the enabled and disabled paths.

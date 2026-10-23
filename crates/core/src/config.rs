@@ -93,6 +93,14 @@ port = 9090
 # after every generation, which is the pre-caching behaviour.
 enable_prefix_caching = true
 
+# Prefer a free slot whose cached prompt prefix best matches the incoming
+# prompt. The prompt is tokenized before a slot is chosen, and only the
+# slot with the longest common prefix is taken. A busy slot is never waited
+# for: if every slot is busy the request is still rejected immediately. This
+# only avoids a cold slot; it never changes the output. Disable it to get the
+# Phase 8 behaviour of taking the oldest free slot.
+enable_affinity_scheduling = true
+
 [bootstrap]
 # Multiaddrs of the peers that are dialed at start up.
 peers = []
@@ -386,12 +394,20 @@ pub struct CacheConfig {
     /// When this is `false`, every generation starts from an empty KV cache,
     /// exactly like before prefix caching existed.
     pub enable_prefix_caching: bool,
+    /// Whether a free slot is chosen by its cached prompt prefix.
+    ///
+    /// The prompt is tokenized before the slot is selected and every free
+    /// slot's cached prefix is scored by the length of the common prefix. The
+    /// best free slot wins; a busy slot is never waited for. When this is
+    /// `false`, the oldest free slot is taken, which is the Phase 8 behaviour.
+    pub enable_affinity_scheduling: bool,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enable_prefix_caching: true,
+            enable_affinity_scheduling: true,
         }
     }
 }
@@ -424,6 +440,7 @@ mod tests {
         assert!(config.metrics.enabled);
         assert_eq!(config.metrics.port, 9090);
         assert!(config.cache.enable_prefix_caching);
+        assert!(config.cache.enable_affinity_scheduling);
         assert!(config.bootstrap.peers.is_empty());
         assert!(config.validate().is_ok());
     }
@@ -434,6 +451,18 @@ mod tests {
             .unwrap_or_else(|err| panic!("the cache section does not parse: {err}"));
 
         assert!(!config.cache.enable_prefix_caching);
+        assert_eq!(config.node, Config::default().node);
+    }
+
+    #[test]
+    fn affinity_scheduling_can_be_disabled() {
+        let config = Config::from_toml_str(
+            "[cache]\nenable_prefix_caching = true\nenable_affinity_scheduling = false\n",
+        )
+        .unwrap_or_else(|err| panic!("the cache section does not parse: {err}"));
+
+        assert!(config.cache.enable_prefix_caching);
+        assert!(!config.cache.enable_affinity_scheduling);
         assert_eq!(config.node, Config::default().node);
     }
 

@@ -118,19 +118,10 @@ impl<'model> LlamaContext<'model> {
     /// Returns an error when the formatted prompt produces no token at all,
     /// which no generation could serve.
     pub fn tokenize_prompt(&self, prompt: &str) -> Result<Vec<i32>, SynapseError> {
-        let formatted_prompt = self.model.format_chat_prompt(prompt);
-        let tokens = self
-            .model
-            .vocab()
-            .tokenize(formatted_prompt.as_bytes(), true, true);
-
-        if tokens.is_empty() {
-            return Err(SynapseError::Engine(
-                "the prompt did not produce a single token".to_owned(),
-            ));
-        }
-
-        Ok(tokens.into_iter().map(|token| token.0).collect())
+        // The model owns the vocabulary and the chat template, so tokenisation
+        // does not have to borrow a context. Keeping the method here as a
+        // convenience for existing callers is all this wrapper does.
+        self.model.tokenize_prompt(prompt)
     }
 
     /// Keeps the KV cache entries of the first `k` prompt tokens and drops

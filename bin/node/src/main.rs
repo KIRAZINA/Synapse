@@ -243,6 +243,7 @@ fn load_pool(config: &Config) -> Result<InferencePool> {
         config.node.max_capacity,
         config.model.context_length,
         config.cache.enable_prefix_caching,
+        config.cache.enable_affinity_scheduling,
     )
     .map_err(|err| anyhow!("failed to load the model '{}': {err}", model_path.display()))?;
 
@@ -250,6 +251,7 @@ fn load_pool(config: &Config) -> Result<InferencePool> {
         model = %config.model.name,
         path = %model_path.display(),
         prefix_caching = config.cache.enable_prefix_caching,
+        affinity_scheduling = config.cache.enable_affinity_scheduling,
         "model loaded successfully"
     );
 

@@ -81,6 +81,32 @@ impl LlamaModel {
         self.inner.vocab()
     }
 
+    /// Formats `prompt` with the chat template of the model and tokenizes it.
+    ///
+    /// Tokenisation only reads the vocabulary; it does not touch the KV cache
+    /// of an inference context. That is what lets the pool tokenize a prompt on
+    /// the request path, before it chooses a slot: the token IDs are the unit
+    /// the cache-affinity decision compares.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the formatted prompt produces no token at all,
+    /// which no generation could serve.
+    pub fn tokenize_prompt(&self, prompt: &str) -> Result<Vec<i32>, SynapseError> {
+        let formatted_prompt = self.format_chat_prompt(prompt);
+        let tokens = self
+            .vocab()
+            .tokenize(formatted_prompt.as_bytes(), true, true);
+
+        if tokens.is_empty() {
+            return Err(SynapseError::Engine(
+                "the prompt did not produce a single token".to_owned(),
+            ));
+        }
+
+        Ok(tokens.into_iter().map(|token| token.0).collect())
+    }
+
     /// Formats `prompt` as a single user message using the chat template that
     /// is embedded in the model.
     ///
