@@ -333,6 +333,7 @@ fn network_settings(
         transport,
         served_models,
         security: config.security.clone(),
+        verification: config.verification.clone(),
     })
 }
 

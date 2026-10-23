@@ -257,3 +257,83 @@ the enabled and disabled paths.
 
 Modes: allowlist (default) or open (dev only, logs warning). allow_loopback defaults false. Nonce lifecycle: issue -> consume -> expire. Quotas: per_peer_concurrency, per_peer_tokens_per_minute (rolling 60s), max_tokens_per_request. Authentication proves identity, not compute correctness.
 
+## Compute integrity
+
+Authentication answers *who* replied. It says nothing about *what* they
+replied: an authenticated peer can return garbage, a truncated generation, or
+the output of a cheaper model, and the data plane will deliver it faithfully.
+Phase 12 adds the layer above authentication: a reputation ledger plus optional
+redundant verification.
+
+### The reputation ledger
+
+Every peer has a score, bounded to `[min_reputation, max_reputation]` and
+tracked alongside its observation count and agreement rate. The ledger is
+bounded in both directions: scores are clamped so a long run of good answers
+cannot buy unlimited credit, and entries are pruned after `entry_ttl_ms` with a
+hard cap of `max_entries` (least recently updated evicted first). It is pruned
+on the same tick that prunes stale telemetry.
+
+Routing uses it as a tie-breaker, not a bypass. Load stays the primary signal,
+because a saturated node is slow no matter how honest it is; among equally
+loaded peers the higher reputation wins, and the peer id only breaks a tie
+between equal scores.
+
+### Redundant verification
+
+A verified request is fanned out to `redundancy` distinct nodes and the outputs
+are compared exactly:
+
+- a **strict majority** agreeing accepts the output, rewards the agreeing peers
+  and penalizes the outliers;
+- **no strict majority** (a tie, or three different answers) flags the request
+  and moves *no* reputation, because there is no evidence about who was wrong.
+
+### Cost: this is K times the compute
+
+Verification is **off by default** (`enabled = false`) and is never forced on
+all traffic. It is reached in exactly two bounded ways:
+
+- **sampled** — `sample_every = N` verifies one request in `N`, so the overhead
+  is `1/N` of traffic times `K`;
+- **explicit** — a caller asks for a single request to be checked.
+
+With `redundancy = 3` a verified request costs 3x the compute of a normal one.
+That is the whole tradeoff: you are buying a spot check, not a proof.
+
+### The determinism constraint
+
+Comparison is only valid when the participants were *supposed* to produce the
+same output. That requires the **same model**, the **same quantization**, and
+**greedy decoding (temperature 0)** with the **same seed**. A request that
+cannot be pinned to a deterministic configuration is refused rather than
+compared, and a participant reporting a different model, quantization or seed is
+excluded from the comparison. Flagging an honest node for a difference the
+configuration guaranteed is worse than not verifying at all.
+
+This is enforced in code, not in a comment: `VerificationRequest::new` rejects
+temperature above zero and an unspecified model or quantization, and
+`verify` rejects incompatible participants.
+
+**Residual risk, stated plainly.** Even with everything pinned, two nodes can
+diverge: floating point addition is not associative, so a different thread count
+or a different CPU/GPU backend can change the reduction order and flip a near-tie
+in the logits. Verification catches gross misbehaviour — garbage output, a
+cheaper model, a truncated generation — which is what an authenticated but
+untrusted peer can actually get away with. It is not a bit-exact proof of the
+computation, and there is no zkML here.
+
+### Metrics
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `synapse_verification_attempts_total` | counter | Comparisons that produced a verdict |
+| `synapse_verification_matches_total` | counter | Comparisons where every participant agreed |
+| `synapse_verification_mismatches_total` | counter | Comparisons with an outlier or no majority |
+| `synapse_peer_reputation` | gauge | Score per peer, labeled `peer` |
+| `synapse_reputation_entries` | gauge | Peers currently in the ledger |
+
+`synapse_peer_reputation` is published per node, so the score of an individual
+peer is observable rather than only a mesh-wide aggregate.
+
+

@@ -115,6 +115,84 @@ pub trait TokenStreamProvider: Send + Sync + 'static {
     fn max_capacity(&self) -> u32;
 }
 
+/// The decoding configuration that a comparison of outputs depends on.
+///
+/// # Why this type exists
+///
+/// Redundant verification compares the token sequences that several nodes
+/// produced for the same prompt. That comparison is only meaningful when the
+/// nodes were *supposed* to produce the same sequence. Two honest nodes will
+/// still disagree if any of the following differ:
+///
+/// * **temperature** — anything above zero samples, so the same prompt yields
+///   different tokens on the same node, let alone on two nodes.
+/// * **model** — a different model has different weights.
+/// * **quantization** — `Q4_K_M` and `Q8_0` of the same model are different
+///   functions; they diverge quickly on long generations.
+/// * **seed** — a seeded sampler is only reproducible when the seed matches.
+///
+/// A request whose [`Determinism`] is not [`is_comparable`](Self::is_comparable)
+/// is therefore **refused** by the verifier instead of being compared: flagging
+/// an honest node for a difference that the configuration guaranteed is worse
+/// than not verifying at all.
+///
+/// # Residual risk (documented, not hidden)
+///
+/// Even with temperature 0, an identical model, an identical quantization and
+/// an identical seed, two nodes can diverge: floating point addition is not
+/// associative, so a different thread count or a different CPU/GPU backend can
+/// change the reduction order and flip a near-tie in the logits. Verification
+/// detects *gross* misbehaviour (garbage output, a cheaper model, a truncated
+/// generation), which is what an authenticated-but-untrusted peer can actually
+/// get away with. It is not a bit-exact proof of the computation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Determinism {
+    /// The sampling temperature. Comparison requires exactly `0.0`.
+    pub temperature: f32,
+    /// The sampler seed. Comparison requires the participants to agree.
+    pub seed: u64,
+    /// The advertised name of the model.
+    pub model: String,
+    /// The quantization of the weights, for example `Q4_K_M`.
+    pub quantization: String,
+}
+
+impl Determinism {
+    /// Builds a deterministic (greedy) decoding configuration.
+    pub fn greedy(model: impl Into<String>, quantization: impl Into<String>, seed: u64) -> Self {
+        Self {
+            temperature: 0.0,
+            seed,
+            model: model.into(),
+            quantization: quantization.into(),
+        }
+    }
+
+    /// Whether outputs produced under this configuration may be compared.
+    ///
+    /// All four properties have to be pinned: a comparison against an
+    /// unspecified model or quantization is not a comparison, it is a guess.
+    pub fn is_comparable(&self) -> bool {
+        self.temperature == 0.0
+            && !self.model.trim().is_empty()
+            && !self.quantization.trim().is_empty()
+    }
+
+    /// Whether two configurations are close enough to compare outputs.
+    ///
+    /// This is stricter than [`is_comparable`](Self::is_comparable): both sides
+    /// have to be comparable *and* identical, because a difference in any
+    /// field makes the outputs legitimately different.
+    pub fn is_compatible_with(&self, other: &Self) -> bool {
+        self.is_comparable()
+            && other.is_comparable()
+            && self.temperature == other.temperature
+            && self.seed == other.seed
+            && self.model == other.model
+            && self.quantization == other.quantization
+    }
+}
+
 /// A single inference request handed to the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompt {

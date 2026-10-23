@@ -14,9 +14,11 @@
 
 pub mod client;
 pub mod discovery;
+pub mod reputation;
 pub mod routing;
 pub mod server;
 pub mod transport;
+pub mod verify;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -30,7 +32,7 @@ use futures_util::StreamExt;
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
-use synapse_core::{NodeTelemetry, SecurityConfig, SynapseError, TokenStreamProvider};
+use synapse_core::{NodeTelemetry, SecurityConfig, SynapseError, TokenStreamProvider, VerificationConfig};
 use tracing::{debug, info, warn};
 
 use crate::discovery::{
@@ -40,6 +42,7 @@ use crate::discovery::{
 use crate::routing::{encode_telemetry, now_ms, RoutingTable};
 use crate::server::InferenceServer;
 use crate::transport::{QuicTransport, TransportSettings};
+use crate::verify::VerificationPolicy;
 
 
 
@@ -108,6 +111,8 @@ pub struct NetworkSettings {
     pub served_models: Arc<ServedModels>,
     /// The security policy of the node.
     pub security: SecurityConfig,
+    /// The compute-integrity policy of the node.
+    pub verification: VerificationConfig,
 }
 
 /// A Synapse node that takes part in the peer to peer network.
@@ -134,6 +139,8 @@ pub struct NetworkNode {
     nonce_store: NonceStore,
     /// The security policy of the node.
     security: SecurityConfig,
+    /// The compute-integrity policy of the node.
+    verification: VerificationPolicy,
 }
 
 impl NetworkNode {
@@ -176,7 +183,10 @@ impl NetworkNode {
             swarm,
             quic,
             provider,
-            routing: Arc::new(RoutingTable::new()),
+            routing: Arc::new(RoutingTable::with_policy(
+                routing::DEFAULT_TTL,
+                &settings.verification,
+            )),
             peer_id,
             listen_addr: settings.listen_addr,
             bootstrap: settings.bootstrap,
@@ -184,6 +194,7 @@ impl NetworkNode {
             peer_addresses: HashMap::new(),
             nonce_store: Arc::new(std::sync::Mutex::new(HashMap::new())),
             security: settings.security,
+            verification: VerificationPolicy::new(settings.verification),
         })
     }
 
@@ -205,6 +216,11 @@ impl NetworkNode {
     /// The telemetry of the known peers.
     pub fn routing(&self) -> &Arc<RoutingTable> {
         &self.routing
+    }
+
+    /// The compute-integrity policy of this node.
+    pub fn verification(&self) -> &VerificationPolicy {
+        &self.verification
     }
 
     /// The addresses the control plane is listening on.
@@ -270,6 +286,11 @@ impl NetworkNode {
                 _ = telemetry_tick.tick() => {
                     self.publish_telemetry();
                     self.routing.remove_stale();
+                    // The reputation of every peer is observable per node, not
+                    // only as a mesh-wide aggregate, and the ledger is pruned
+                    // on the same tick as the telemetry so neither structure
+                    // can grow without bound.
+                    verify::publish_reputation(self.routing.reputation_ledger());
                 }
             }
         }
@@ -574,4 +595,3 @@ impl NetworkNode {
 pub fn generate_keypair() -> libp2p::identity::Keypair {
     libp2p::identity::Keypair::generate_ed25519()
 }
-pub mod verify;

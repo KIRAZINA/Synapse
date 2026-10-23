@@ -118,11 +118,54 @@ auth_timeout_ms = 5000
 nonce_ttl_ms = 30000
 allow_loopback = false
 
+# The largest max_tokens a single request may ask for. This is a ceiling on
+# the request, not a budget: the per-peer budget lives in [security.access].
+max_tokens_per_request = 4096
+
 [security.access]
 trusted_peers = []
 per_peer_concurrency = 1
 per_peer_tokens_per_minute = 4096
-max_tokens_per_request = 4096
+
+[verification]
+# Redundant verification: run the same request on several nodes and compare
+# the outputs. This is OFF by default and it costs K times the compute, so it
+# is meant for sampled or explicitly requested checks, never for all traffic.
+#
+# The comparison is only meaningful when every node runs the same model and
+# the same quantization at temperature 0 (greedy decoding). A node that
+# samples, or that serves a different quantization, produces different tokens
+# for the same prompt and would be flagged as a liar by a naive comparison.
+# Requests that cannot be pinned to a deterministic configuration are refused
+# instead of being compared.
+enabled = false
+
+# How many nodes a verified request is fanned out to. 3 tolerates one liar
+# (a strict majority still agrees); 2 only detects a disagreement without
+# telling you which side is wrong.
+redundancy = 3
+
+# Verify one request in every N. 0 disables sampling entirely, which is what
+# an operator who only wants on-demand verification should set.
+sample_every = 0
+
+# Reputation delta applied to every node that agreed with the majority.
+reward = 1.0
+
+# Reputation delta applied to a node that disagreed with the majority.
+penalty = -5.0
+
+# Reputation is bounded to this range so that a node cannot buy its way out
+# of a bad history with a long run of good answers.
+min_reputation = -50.0
+max_reputation = 50.0
+
+# A reputation entry that has not been updated for this long is pruned, so
+# the ledger cannot grow without bound on a long-lived node.
+entry_ttl_ms = 3600000
+
+# The maximum number of reputation entries that are kept.
+max_entries = 4096
 
 [bootstrap]
 # Multiaddrs of the peers that are dialed at start up.
@@ -179,7 +222,7 @@ pub enum ConfigError {
 }
 
 /// The complete configuration of a node.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// The control plane and the capacity of the node.
@@ -196,6 +239,8 @@ pub struct Config {
     pub pool: PoolConfig,
     /// The authentication and authorization policy.
     pub security: SecurityConfig,
+    /// The compute-integrity policy: redundant verification.
+    pub verification: VerificationConfig,
     /// The peers that are dialed at start up.
     pub bootstrap: BootstrapConfig,
 }
@@ -372,6 +417,121 @@ impl Config {
                  own KV cache; make sure the host has enough memory for the model plus this cache \
                  (the estimate is conservative)"
             );
+        }
+
+        Ok(())
+    }
+}
+
+/// The compute-integrity policy of the node.
+///
+/// Authentication (Phase 11) proves *who* answered. It says nothing about
+/// whether the answer is *correct*: an authenticated node can still return
+/// garbage, or the output of a smaller model. Redundant verification closes
+/// that gap by running the same request on several nodes and comparing the
+/// outputs.
+///
+/// # Cost
+///
+/// A verified request costs `redundancy` times the compute of a normal one.
+/// That is why verification is **off by default** and why the two ways to
+/// turn it on are both bounded: sampling (`sample_every`) checks a fraction of
+/// the traffic, and an explicit per-request flag checks a single request.
+/// Verification is never forced on all traffic.
+///
+/// # The determinism constraint
+///
+/// Comparing outputs is only valid when every node runs the **same model at
+/// the same quantization** and decodes **greedily (temperature 0)**. Any
+/// sampling, any different quantization, any different context or prompt
+/// template produces a different token sequence for the same prompt, and a
+/// naive comparison would then punish an honest node. A request that cannot be
+/// pinned to a deterministic configuration is therefore refused rather than
+/// compared; see [`crate::types::Determinism`].
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VerificationConfig {
+    /// Whether sampled verification runs at all.
+    pub enabled: bool,
+    /// How many nodes a verified request is fanned out to.
+    pub redundancy: usize,
+    /// Verify one request in every `N`. `0` disables sampling.
+    pub sample_every: u64,
+    /// Reputation delta for a node that agreed with the majority.
+    pub reward: f64,
+    /// Reputation delta for a node that disagreed with the majority.
+    pub penalty: f64,
+    /// Lower bound of a reputation score.
+    pub min_reputation: f64,
+    /// Upper bound of a reputation score.
+    pub max_reputation: f64,
+    /// How long an untouched reputation entry is kept, in milliseconds.
+    pub entry_ttl_ms: u64,
+    /// The maximum number of reputation entries that are kept.
+    pub max_entries: usize,
+}
+
+impl Default for VerificationConfig {
+    fn default() -> Self {
+        Self {
+            // Off by default: verification multiplies the cost of a request by
+            // `redundancy`, so it is an explicit decision, never a surprise.
+            enabled: false,
+            redundancy: 3,
+            sample_every: 0,
+            reward: 1.0,
+            penalty: -5.0,
+            min_reputation: -50.0,
+            max_reputation: 50.0,
+            entry_ttl_ms: 3_600_000,
+            max_entries: 4096,
+        }
+    }
+}
+
+impl VerificationConfig {
+    /// Whether a request with this sequence number is sampled for verification.
+    ///
+    /// Sampling is deterministic in the request counter, so a run of requests
+    /// is spread evenly instead of being verified in random clumps.
+    pub fn should_sample(&self, request_seq: u64) -> bool {
+        self.enabled && self.sample_every > 0 && request_seq % self.sample_every == 0
+    }
+
+    /// Checks the values that no default can guard against.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.redundancy < 2 {
+            return Err(ConfigError::Invalid(
+                "verification.redundancy has to be at least 2: a single output has nothing to be \
+                 compared against"
+                    .to_owned(),
+            ));
+        }
+
+        if self.min_reputation >= self.max_reputation {
+            return Err(ConfigError::Invalid(format!(
+                "verification.min_reputation ({}) has to be lower than verification.max_reputation \
+                 ({})",
+                self.min_reputation, self.max_reputation
+            )));
+        }
+
+        if self.max_entries == 0 {
+            return Err(ConfigError::Invalid(
+                "verification.max_entries has to be at least 1".to_owned(),
+            ));
+        }
+
+        if self.entry_ttl_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "verification.entry_ttl_ms has to be at least 1".to_owned(),
+            ));
+        }
+
+        if !self.reward.is_finite() || !self.penalty.is_finite() {
+            return Err(ConfigError::Invalid(
+                "verification.reward and verification.penalty have to be finite".to_owned(),
+            ));
         }
 
         Ok(())

@@ -9,7 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use libp2p::PeerId;
-use synapse_core::NodeTelemetry;
+use synapse_core::{NodeTelemetry, VerificationConfig};
+
+use crate::reputation::ReputationLedger;
 
 /// How long a telemetry entry stays valid.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(15);
@@ -20,7 +22,7 @@ pub struct RoutingTable {
     /// The telemetry of the peers.
     peers: DashMap<PeerId, NodeTelemetry>,
     /// Reputation scores per peer.
-    reputation_scores: DashMap<String, f64>,
+    reputation: ReputationLedger,
     /// How long a telemetry entry stays valid.
     ttl: Duration,
 }
@@ -41,7 +43,19 @@ impl RoutingTable {
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             peers: DashMap::new(),
-            reputation_scores: DashMap::new(),
+            reputation: ReputationLedger::from_config(&VerificationConfig::default()),
+            ttl,
+        }
+    }
+
+    /// Builds a table with the given time to live and verification policy.
+    ///
+    /// The reputation bounds come from the policy, so an operator who tightens
+    /// the ledger does not have to change two places.
+    pub fn with_policy(ttl: Duration, verification: &VerificationConfig) -> Self {
+        Self {
+            peers: DashMap::new(),
+            reputation: ReputationLedger::from_config(verification),
             ttl,
         }
     }
@@ -76,13 +90,22 @@ impl RoutingTable {
 
     /// Updates the reputation of a peer.
     pub fn update_reputation(&self, peer: &str, delta: f64) {
-        let mut entry = self.reputation_scores.entry(peer.to_owned()).or_insert(0.0);
-        *entry += delta;
+        self.reputation.record(peer, delta, delta >= 0.0);
+    }
+
+    /// Records a verification outcome for a peer.
+    pub fn record_verification(&self, peer: &str, delta: f64, agreed: bool) {
+        self.reputation.record(peer, delta, agreed);
     }
 
     /// The reputation of a peer.
     pub fn reputation(&self, peer: &str) -> f64 {
-        self.reputation_scores.get(peer).map(|v| *v).unwrap_or(0.0)
+        self.reputation.score(peer)
+    }
+
+    /// The reputation ledger.
+    pub fn reputation_ledger(&self) -> &ReputationLedger {
+        &self.reputation
     }
 
     /// The number of peers in the table.
@@ -112,6 +135,14 @@ impl RoutingTable {
     /// is never routed to a node that would then fail with "no model has been
     /// loaded yet". The peer with the fewest active requests wins; ties are
     /// broken by the peer id so that the choice is stable.
+    /// # Reputation
+    ///
+    /// Load is the primary signal: a node that is already saturated will be
+    /// slow no matter how honest it is. Reputation breaks ties between peers
+    /// that are equally loaded, and it is compared *before* the peer id so that
+    /// the choice is still stable but no longer arbitrary. A peer with a
+    /// negative score therefore loses to an equally loaded peer with a neutral
+    /// or positive one, which is the whole point of keeping the ledger.
     pub fn get_best_peer(&self, model: Option<&str>) -> Option<NodeTelemetry> {
         self.peers
             .iter()
@@ -137,6 +168,45 @@ impl RoutingTable {
                     })
                     .then_with(|| left.peer_id.cmp(&right.peer_id))
             })
+    }
+
+    /// The `count` best peers that can serve `model`, best first.
+    ///
+    /// This is what redundant verification fans out to: it needs several
+    /// *distinct* nodes running the same model, not the same node several
+    /// times. The ordering is the same as [`get_best_peer`](Self::get_best_peer),
+    /// so the first entry is the peer a normal request would have gone to.
+    pub fn best_peers(&self, model: Option<&str>, count: usize) -> Vec<NodeTelemetry> {
+        let mut candidates: Vec<NodeTelemetry> = self
+            .peers
+            .iter()
+            .filter(|entry| !self.is_stale(entry.value()))
+            .map(|entry| entry.value().clone())
+            .filter(|telemetry| {
+                telemetry.max_capacity > 0 && telemetry.active_requests < telemetry.max_capacity
+            })
+            .filter(|telemetry| match model {
+                Some(model) => telemetry
+                    .supported_models
+                    .iter()
+                    .any(|served| served == model),
+                None => true,
+            })
+            .collect();
+
+        candidates.sort_by(|left, right| {
+            left.active_requests
+                .cmp(&right.active_requests)
+                .then_with(|| {
+                    let lr = self.reputation(&left.peer_id);
+                    let rr = self.reputation(&right.peer_id);
+                    rr.partial_cmp(&lr).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.peer_id.cmp(&right.peer_id))
+        });
+
+        candidates.truncate(count);
+        candidates
     }
 
     /// The models that the known peers serve, sorted and without duplicates.
@@ -175,6 +245,12 @@ impl RoutingTable {
         for peer in stale {
             self.peers.remove(&peer);
         }
+
+        // The ledger is pruned by its own time to live, which is deliberately
+        // much longer than the telemetry TTL: a peer that went quiet for a
+        // minute is not a peer that lied.
+        self.reputation.prune();
+
         removed
     }
 

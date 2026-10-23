@@ -1,7 +1,6 @@
 #![allow(clippy::all)]
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use libp2p::identity;
