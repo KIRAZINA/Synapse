@@ -153,9 +153,28 @@ async fn run() -> Result<()> {
         }
     };
 
-    // The node keeps running until it is asked to stop.
-    let _ = (&mut shutdown_receiver).await;
-    info!("shutdown signal received, stopping the inference pool");
+    // The node keeps running until it is asked to stop, or until every
+    // inference slot has retired, which is a terminal failure: the node
+    // cannot serve anything any more and must be restarted by its supervisor.
+    let mut zero_capacity = false;
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_receiver => break,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                if pool.all_retired() {
+                    zero_capacity = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if zero_capacity {
+        error!("all inference slots retired; the node is unusable and is exiting with a failure status");
+        // Stop the network task and the pool below, then propagate the error.
+    } else {
+        info!("shutdown signal received, stopping the inference pool");
+    }
 
     // Dropping the receiver tells the actor that nobody is listening any
     // more, so an in-flight generation is aborted.
@@ -178,6 +197,10 @@ async fn run() -> Result<()> {
     let _ = network_task.await;
 
     shutdown_pool(pool);
+
+    if zero_capacity {
+        return Err(anyhow!("all inference slots retired; the node is unusable"));
+    }
 
     info!("Synapse Node stopped gracefully");
     Ok(())
@@ -244,6 +267,8 @@ fn load_pool(config: &Config) -> Result<InferencePool> {
         config.model.context_length,
         config.cache.enable_prefix_caching,
         config.cache.enable_affinity_scheduling,
+        config.pool.queue_capacity,
+        config.pool.queue_wait_ms,
     )
     .map_err(|err| anyhow!("failed to load the model '{}': {err}", model_path.display()))?;
 
@@ -252,6 +277,8 @@ fn load_pool(config: &Config) -> Result<InferencePool> {
         path = %model_path.display(),
         prefix_caching = config.cache.enable_prefix_caching,
         affinity_scheduling = config.cache.enable_affinity_scheduling,
+        queue_capacity = config.pool.queue_capacity,
+        queue_wait_ms = config.pool.queue_wait_ms,
         "model loaded successfully"
     );
 
