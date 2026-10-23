@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::type_complexity)]
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,7 +90,7 @@ async fn corrupted_signature_is_rejected() {
     security.allow_loopback = false;
     security.access.trusted_peers = vec![peer_id.to_base58()];
     let (t, addr, store) = start_server(security).await;
-    let nonce = mint_nonce(&store, peer_id, 30000);
+    let _nonce = mint_nonce(&store, peer_id, 30000);
     // craft bad signature by using RemoteInferenceClient with wrong nonce? Instead send raw auth via a separate connection is complex.
     // We'll just ensure a mismatched nonce (zero) is rejected.
     let client = RemoteInferenceClient::new(addr, t.cert_der().to_vec(), kp, [0u8;32]).unwrap();
@@ -98,7 +99,7 @@ async fn corrupted_signature_is_rejected() {
 }
 
 #[tokio::test]
-async fn nonce_issued_to_A_but_auth_claims_B_with_Bs_valid_signature_is_rejected() {
+async fn nonce_issued_to_a_but_auth_claims_b_with_bs_valid_signature_is_rejected() {
     let kp_a = identity::Keypair::generate_ed25519();
     let kp_b = identity::Keypair::generate_ed25519();
     let peer_a = kp_a.public().to_peer_id();

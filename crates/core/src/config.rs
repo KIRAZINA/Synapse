@@ -120,6 +120,9 @@ allow_loopback = false
 
 [security.access]
 trusted_peers = []
+per_peer_concurrency = 1
+per_peer_tokens_per_minute = 4096
+max_tokens_per_request = 4096
 
 [bootstrap]
 # Multiaddrs of the peers that are dialed at start up.
@@ -207,6 +210,8 @@ pub struct SecurityConfig {
     pub auth_timeout_ms: u64,
     /// Lifetime of an issued nonce, in milliseconds.
     pub nonce_ttl_ms: u64,
+    /// Maximum max_tokens accepted per request.
+    pub max_tokens_per_request: u64,
     /// Whether loopback peers are admitted without listing.
     pub allow_loopback: bool,
     /// Access control lists and quotas.
@@ -219,18 +224,33 @@ impl Default for SecurityConfig {
             mode: "allowlist".to_owned(),
             auth_timeout_ms: 5_000,
             nonce_ttl_ms: 30_000,
-            allow_loopback: true,
+            max_tokens_per_request: 4096,
+            allow_loopback: false,
             access: SecurityAccessConfig::default(),
         }
     }
 }
 
 /// Access control lists and per-peer quotas.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecurityAccessConfig {
     /// libp2p PeerId strings that are allowed to use this node.
     pub trusted_peers: Vec<String>,
+    /// Maximum concurrent admitted requests per peer.
+    pub per_peer_concurrency: usize,
+    /// Rolling 60s budget of requested max_tokens per peer.
+    pub per_peer_tokens_per_minute: u64,
+}
+
+impl Default for SecurityAccessConfig {
+    fn default() -> Self {
+        Self {
+            trusted_peers: Vec::new(),
+            per_peer_concurrency: 1,
+            per_peer_tokens_per_minute: 4096,
+        }
+    }
 }
 
 impl Config {
