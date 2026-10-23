@@ -253,6 +253,7 @@ impl NetworkNode {
             Arc::clone(&self.provider),
             self.security.clone(),
             Arc::clone(&self.nonce_store),
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         );
         tokio::spawn(async move {
             server.run().await;

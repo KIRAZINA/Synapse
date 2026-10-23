@@ -25,7 +25,7 @@ async fn start_server(security: SecurityConfig) -> (QuicTransport, SocketAddr, s
     let transport = QuicTransport::new().await.unwrap();
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, transport.local_port()));
     let store = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let server = InferenceServer::new(transport.endpoint().clone(), Arc::new(TestProvider), security, store.clone());
+    let server = InferenceServer::new(transport.endpoint().clone(), Arc::new(TestProvider), security, store.clone(), std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
     tokio::spawn(server.run());
     (transport, addr, store)
 }

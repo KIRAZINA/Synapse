@@ -136,6 +136,7 @@ async fn start_server(
         provider as Arc<dyn TokenStreamProvider>,
         security,
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     );
     tokio::spawn(server.run());
 
