@@ -63,8 +63,9 @@ What concurrency buys:
 - a slow or disconnected client cannot block everybody else,
 - the advertised `max_capacity` is honest: the contexts and their KV caches
   exist before the first request arrives,
-- when every slot is busy, the node rejects the next request immediately
-  instead of building a queue of work it cannot keep up with.
+- a short burst is absorbed by a bounded FIFO admission queue instead of being
+  rejected immediately, while sustained overload is still rejected once that
+  queue is full or its deadline passes.
 
 What concurrency does **not** buy is more tokens per second on the same CPU.
 The real levers for throughput are batching (evaluating several sequences in
@@ -95,9 +96,18 @@ from zero.
 With `cache.enable_affinity_scheduling = true` (the default), the pool
 tokenizes the prompt before it takes a slot and picks the *free* slot whose
 cached prefix has the longest common token prefix with the incoming prompt.
-Affinity is opportunistic: a busy slot is never waited for, and a full pool is
-still rejected immediately. Set it to `false` for the Phase 8 behaviour of
-taking the oldest free slot.
+Affinity is opportunistic: a busy slot is never waited for. With the default
+admission queue a request waits for the next free slot; with `[pool]
+queue_capacity = 0` a full pool is rejected immediately. Affinity only chooses
+which free slot a dequeued request receives, never the queue order. Set it to
+`false` for the Phase 8 behaviour of taking the oldest free slot.
+
+Affinity is greedy: it always takes the free slot with the longest match, even
+when that match is weak and the slot currently holds a *hot* prefix that is
+likely to be requested again. Evicting the hot prefix for a weak match can
+cause cache shaking under heterogeneous load. This is the classic online
+caching trade-off and accepted for now. If real traffic shows shaking, the next
+refinement is to prefer an empty slot when the best match is below a threshold.
 
 To keep a hit byte-identical to a full prefill, the engine disables
 `llama.cpp`'s tiled K-quant matmul (`GGML_CPU_TILED_MM=0`). That kernel picks
@@ -127,6 +137,26 @@ Set `cache.enable_prefix_caching = false` to clear the KV cache after every
 generation, which is the behaviour from before the cache existed. Affinity is
 disabled together with the cache, because there is no prefix to match.
 
+### Admission queue
+
+When every slot is busy, a request enters a bounded FIFO queue instead of being
+rejected immediately. The request path only enqueues the tokenized prompt and
+returns a stream receiver; the actual waiting happens on a dedicated admission
+thread. That thread releases the registry mutex while it waits on a condition
+variable, and a slot release or a new enqueue wakes it without busy-waiting.
+Dispatch order is strict arrival order. When a slot frees, the oldest request
+is taken and affinity chooses *which* free slot it receives. A request whose
+client disconnected while it was queued is dropped before it can take a slot.
+
+`[pool] queue_capacity` is the number of waiting requests (the request already
+running on a slot is not counted), and `queue_wait_ms` is the deadline measured
+from enqueue. A request that finds a full queue is rejected immediately with
+`queue full`; one whose deadline passes is rejected with a terminal
+`queue timeout` error event. `queue_capacity = 0` disables the queue entirely
+and reproduces the Phase 9 reject-on-full behaviour exactly. A node whose last
+slot retired has live capacity zero, so it does not queue work it can never
+serve.
+
 ## Configuration
 
 Every field is optional and unknown keys are rejected. A missing file falls
@@ -155,6 +185,12 @@ port = 9090
 enable_prefix_caching = true
 enable_affinity_scheduling = true
 
+[pool]
+# Waiting requests when every slot is busy. 0 disables the queue.
+queue_capacity = 8
+# Deadline for a queued request, in milliseconds.
+queue_wait_ms = 5000
+
 [bootstrap]
 peers = []
 ```
@@ -176,6 +212,10 @@ peers = []
 | `synapse_prefix_cache_hits_total` | counter | Requests that reused at least one prompt token |
 | `synapse_prefill_tokens_saved_total` | counter | Prompt tokens skipped through the cache |
 | `synapse_slot_affinity_matches_total` | counter | Selections of a free slot with a non-empty cached-prefix match |
+| `synapse_queue_depth` | gauge | Requests currently waiting for a slot |
+| `synapse_queue_wait_ms` | histogram | Time a queued request waited before admission or timeout |
+| `synapse_queue_admitted_total` | counter | Queued requests that were assigned a slot |
+| `synapse_queue_rejected_total` | counter | Queue rejections, labeled `reason="full"`, `"timeout"` or `"no_capacity"` |
 
 Derive the hit rate from `synapse_prefix_cache_hits_total /
 synapse_prefix_cache_requests_total`. The saved-token counter is the direct
@@ -190,6 +230,13 @@ drops when a slot is retired, and the same live number is what
 `max_capacity` — and therefore `NodeTelemetry.max_capacity` — reports to the
 router. A node never advertises capacity it has lost.
 
+A node that retires its last slot therefore advertises `max_capacity = 0`. It
+stays in the mesh as an observer (its telemetry is still gossiped, so operators
+can see it), but the router explicitly excludes zero-capacity peers from both
+best-peer selection and the advertised model set. Such a node cannot queue
+work either: the pool rejects immediately when `live == 0` instead of waiting
+for a slot that will never exist.
+
 ## Tests
 
 ```sh
@@ -200,5 +247,8 @@ The model-backed pool tests skip themselves when the GGUF file is absent. They
 cover real concurrency, capacity rejection, disconnects, reuse after a panic,
 byte-identical output for cold, partial and full prefix hits, the live-capacity
 drop when a slot is retired, and the A, A, B, A affinity comparison at
-capacity 2. That comparison prints the hit count, saved tokens and affinity
-matches for the enabled and disabled paths.
+capacity 2. The queue tests cover burst absorption, queue-full and timeout
+reasons, FIFO dispatch order, a client that disconnects while queued, the
+`queue_capacity = 0` Phase 9 regression, and a 20-request stress burst. The
+affinity comparison prints the hit count, saved tokens and affinity matches for
+the enabled and disabled paths.

@@ -92,18 +92,20 @@ impl RoutingTable {
 
     /// The peer with the lowest load that can serve `model`.
     ///
-    /// Peers that are at capacity are skipped: a request that is sent to them
-    /// would only queue up. When a model is given, only peers that advertise
-    /// it are considered, so a client is never routed to a node that would
-    /// then fail with "no model has been loaded yet". The peer with the
-    /// fewest active requests wins; ties are broken by the peer id so that
-    /// the choice is stable.
+    /// Peers that are at capacity or have retired every slot are skipped: a
+    /// request sent to them would be queued behind work or rejected. When a
+    /// model is given, only peers that advertise it are considered, so a client
+    /// is never routed to a node that would then fail with "no model has been
+    /// loaded yet". The peer with the fewest active requests wins; ties are
+    /// broken by the peer id so that the choice is stable.
     pub fn get_best_peer(&self, model: Option<&str>) -> Option<NodeTelemetry> {
         self.peers
             .iter()
             .filter(|entry| !self.is_stale(entry.value()))
             .map(|entry| entry.value().clone())
-            .filter(|telemetry| telemetry.active_requests < telemetry.max_capacity)
+            .filter(|telemetry| {
+                telemetry.max_capacity > 0 && telemetry.active_requests < telemetry.max_capacity
+            })
             .filter(|telemetry| match model {
                 Some(model) => telemetry
                     .supported_models
@@ -127,6 +129,7 @@ impl RoutingTable {
             .peers
             .iter()
             .filter(|entry| !self.is_stale(entry.value()))
+            .filter(|entry| entry.value().max_capacity > 0)
             .flat_map(|entry| entry.value().supported_models.clone())
             .collect();
 
@@ -261,6 +264,26 @@ mod tests {
         table.update(full, telemetry(&full, 1, 1));
 
         assert!(table.get_best_peer(None).is_none());
+    }
+
+    #[test]
+    fn skips_retired_peers_with_zero_capacity() {
+        let table = RoutingTable::new();
+        let retired = peer();
+        let live = peer();
+
+        // A node whose last slot retired still gossips telemetry, but it must
+        // never receive work.
+        table.update(retired, telemetry(&retired, 0, 0));
+        assert!(table.get_best_peer(None).is_none());
+        assert!(table.models().is_empty());
+
+        table.update(live, telemetry(&live, 0, 1));
+        let best = table.get_best_peer(Some("tinyllama-1.1b"));
+        assert_eq!(
+            best.map(|telemetry| telemetry.peer_id),
+            Some(live.to_base58())
+        );
     }
 
     #[test]

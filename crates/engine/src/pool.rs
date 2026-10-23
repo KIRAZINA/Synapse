@@ -10,30 +10,35 @@
 //! # Acquiring a slot
 //!
 //! The free slots live in an inspectable registry guarded by a [`Mutex`], not
-//! in a channel. Acquiring is a non-blocking selection under that lock; when no
-//! slot is free the request is rejected immediately with [`AtCapacity`]. There
-//! is no request queue: a node that cannot serve a request says so instead of
-//! making the client wait behind generations it did not ask for.
+//! in a channel. The request path takes a free slot under that lock when the
+//! queue is empty. If every slot is busy, the request is enqueued in a bounded
+//! FIFO and returns its stream receiver immediately; a dedicated admission
+//! thread waits for a release and dispatches the oldest request. A queue
+//! capacity of zero disables that path and restores immediate rejection with
+//! [`AtCapacity`], exactly like Phase 9.
 //!
-//! The lock is held only while the registry is read or updated: selection,
-//! release and retirement. It is never held while a model runs. A generation
-//! may take minutes; the registry critical section takes microseconds.
+//! The registry lock is held only while the registry is read or updated:
+//! selection, release, retirement and queue mutation. It is never held while a
+//! model runs, and the admission thread releases it while waiting on the
+//! condition variable. A generation may take minutes; the registry critical
+//! section takes microseconds.
 //!
 //! The acquired slot is represented by a [`SlotGuard`] that travels to the slot
 //! thread inside the command. The slot thread drops the guard after the
 //! generation finishes, after the client aborts and after a failure, and
-//! dropping the guard is what marks the slot free again and decrements the busy
-//! counter. Because the guard is owned by the thread that runs the generation,
-//! a panic unwinds through the same `Drop` and cannot leak the slot either.
+//! dropping the guard is what marks the slot free again, decrements the busy
+//! counter and wakes the admission thread. Because the guard is owned by the
+//! thread that runs the generation, a panic unwinds through the same `Drop` and
+//! cannot leak the slot either.
 //!
 //! # Cache affinity
 //!
 //! With `cache.enable_affinity_scheduling` enabled (the default), the pool
 //! tokenizes the prompt on the request path and scores every *free* slot by the
 //! longest common prefix (LCP) of its cached prompt tokens and the incoming
-//! prompt. It takes the best free slot, breaking ties by free-list order. A
-//! busy slot is never waited for: affinity is opportunistic, and a full pool is
-//! still a rejection. When the option is disabled, selection is the Phase 8
+//! prompt. It takes the best free slot, breaking ties by free-list order.
+//! Affinity only chooses which free slot a request receives; it never reorders
+//! the admission queue. When the option is disabled, selection is the Phase 8
 //! FIFO of free slots and no scoring happens.
 //!
 //! # Context hygiene
@@ -57,8 +62,9 @@ use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use flume::{Receiver, Sender};
 use synapse_core::{SynapseError, TokenEvent, TokenStreamProvider};
@@ -90,6 +96,13 @@ const DEFAULT_THREADS: usize = 4;
 /// One mebibyte, used for the KV cache log lines.
 const MIB: u64 = 1024 * 1024;
 
+/// How long the admission thread sleeps when there is nothing to dispatch.
+///
+/// Wakes are edge-triggered by the condition variable; this periodic bound
+/// only keeps the shutdown check responsive if a notify is ever missed. It is
+/// not a busy wait.
+const ADMISSION_IDLE_WAIT: Duration = Duration::from_millis(200);
+
 /// Whether a slot can serve a request right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotStatus {
@@ -116,6 +129,26 @@ struct SlotEntry {
     cached_prefix: Vec<i32>,
 }
 
+/// One request waiting for a slot.
+///
+/// The tokenized prompt is stored while the request waits, so admission can
+/// still use cache affinity once a slot frees. The sender is kept alive by the
+/// entry: when the client drops its receiver, `is_disconnected()` becomes true
+/// and the entry is discarded instead of consuming a slot.
+#[derive(Debug)]
+struct QueuedRequest {
+    /// Tokenized prompt, used for affinity selection at admission time.
+    tokens: Vec<i32>,
+    /// Maximum number of tokens to generate.
+    max_tokens: usize,
+    /// Channel the generation eventually streams on.
+    token_sender: Sender<TokenEvent>,
+    /// When the request entered the queue, used for the wait histogram.
+    queued_at: Instant,
+    /// Absolute deadline for the wait, `queued_at + queue_wait`.
+    deadline: Instant,
+}
+
 /// The inspectable slot registry.
 ///
 /// `free` is a FIFO of free slot indices. Keeping it as a queue rather than
@@ -129,6 +162,8 @@ struct SlotRegistry {
     slots: Vec<SlotEntry>,
     /// Indices of the slots that are currently free, oldest first.
     free: VecDeque<usize>,
+    /// Requests waiting for a slot, oldest first.
+    queue: VecDeque<QueuedRequest>,
     /// Number of slots that were not retired. This is the live capacity.
     live: usize,
 }
@@ -201,6 +236,41 @@ fn lock_registry(registry: &Mutex<SlotRegistry>) -> MutexGuard<'_, SlotRegistry>
     }
 }
 
+/// Marks a free slot busy and builds the guard that owns it.
+///
+/// The caller holds the registry lock. The returned guard carries clones of the
+/// registry, the busy counter and the wakeup variable, so it can release the
+/// slot from whichever thread runs the generation.
+fn checkout_slot(
+    registry: &mut SlotRegistry,
+    index: usize,
+    active: &Arc<AtomicUsize>,
+    registry_arc: &Arc<Mutex<SlotRegistry>>,
+    wakeup: &Arc<Condvar>,
+    zero_capacity: &Arc<AtomicBool>,
+) -> Option<SlotGuard> {
+    let commands = match registry.slots.get_mut(index) {
+        Some(entry) if entry.status == SlotStatus::Free => {
+            entry.status = SlotStatus::Busy;
+            entry.commands.clone()
+        }
+        _ => return None,
+    };
+
+    let busy = active.fetch_add(1, Ordering::AcqRel) + 1;
+    metrics::gauge!("synapse_active_generations").set(busy as f64);
+
+    Some(SlotGuard {
+        index,
+        commands,
+        registry: Arc::clone(registry_arc),
+        active: Arc::clone(active),
+        wakeup: Arc::clone(wakeup),
+        zero_capacity: Arc::clone(zero_capacity),
+        released: false,
+    })
+}
+
 /// A slot that was checked out of the pool while it serves a request.
 ///
 /// Dropping the guard releases the slot: it is pushed back onto the free queue
@@ -218,6 +288,10 @@ pub struct SlotGuard {
     registry: Arc<Mutex<SlotRegistry>>,
     /// The number of busy slots, shared with the telemetry of the pool.
     active: Arc<AtomicUsize>,
+    /// Wakes the admission thread when this slot becomes free or retires.
+    wakeup: Arc<Condvar>,
+    /// Set when the last live slot retires.
+    zero_capacity: Arc<AtomicBool>,
     /// `true` once the slot was released or retired.
     released: bool,
 }
@@ -273,6 +347,19 @@ impl SlotGuard {
             retired
         };
 
+        // The registry lock is no longer held; record the terminal state and
+        // log it so an operator and a supervisor can react.
+        if retired {
+            // Re-check live under a fresh lock to avoid a stale read.
+            let live = lock_registry(&self.registry).live;
+            if live == 0 {
+                self.zero_capacity.store(true, Ordering::SeqCst);
+                error!(
+                    "all inference slots retired; the node is unusable and must be restarted"
+                );
+            }
+        }
+
         if retired {
             metrics::counter!("synapse_slots_retired_total").increment(1);
             let live = lock_registry(&self.registry).live;
@@ -288,6 +375,10 @@ impl SlotGuard {
 
         let busy = self.active.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
         metrics::gauge!("synapse_active_generations").set(busy as f64);
+
+        // A retirement can leave the pool with zero live slots; the admission
+        // thread must wake to reject anything that is still queued.
+        self.wakeup.notify_all();
     }
 }
 
@@ -314,6 +405,10 @@ impl Drop for SlotGuard {
 
         let busy = self.active.fetch_sub(1, Ordering::AcqRel).saturating_sub(1);
         metrics::gauge!("synapse_active_generations").set(busy as f64);
+
+        // The slot is in the free queue now (the lock was released above), so
+        // waking the admission thread cannot observe a half-released slot.
+        self.wakeup.notify_all();
     }
 }
 
@@ -364,22 +459,337 @@ enum SlotCommand {
     Shutdown,
 }
 
+/// Sends one generation command to the slot that owns `guard`.
+///
+/// The guard moves into the command. If the slot thread is gone, dropping the
+/// failed command drops the guard, which returns the slot to the free list.
+fn dispatch_command(
+    guard: SlotGuard,
+    tokens: Vec<i32>,
+    prefill_from: usize,
+    max_tokens: usize,
+    token_sender: Sender<TokenEvent>,
+) -> Result<(), SynapseError> {
+    let command_sender = guard.commands().clone();
+    let command = SlotCommand::Generate {
+        tokens,
+        prefill_from,
+        max_tokens,
+        token_sender,
+        guard,
+    };
+
+    command_sender
+        .send(command)
+        .map_err(|_| SynapseError::Engine("the inference slot thread is gone".to_owned()))
+}
+
+/// The admission thread and the handle needed to stop it.
+///
+/// The thread is the only place that waits for a slot. Request threads only
+/// enqueue and return, and the registry lock is released by the condition
+/// variable while the thread waits, so neither a request nor a Tokio task ever
+/// blocks on a busy pool.
+#[derive(Debug)]
+struct Admission {
+    /// The condition variable the thread waits on.
+    wakeup: Arc<Condvar>,
+    /// Set at shutdown so the thread drains the queue and exits.
+    shutdown: Arc<AtomicBool>,
+    /// The thread, taken when it is joined.
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Admission {
+    /// Starts the admission thread.
+    fn spawn(
+        registry: Arc<Mutex<SlotRegistry>>,
+        active: Arc<AtomicUsize>,
+        wakeup: Arc<Condvar>,
+        enable_affinity: bool,
+        zero_capacity: Arc<AtomicBool>,
+    ) -> std::io::Result<Self> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let thread_wakeup = Arc::clone(&wakeup);
+        let thread_zero = Arc::clone(&zero_capacity);
+
+        let handle = thread::Builder::new()
+            .name("synapse-admission".to_owned())
+            .spawn(move || {
+                admission_loop(
+                    registry,
+                    active,
+                    thread_wakeup,
+                    enable_affinity,
+                    thread_shutdown,
+                    thread_zero,
+                )
+            })?;
+
+        Ok(Self {
+            wakeup,
+            shutdown,
+            handle: Some(handle),
+        })
+    }
+
+    /// Stops the admission thread and waits for it to finish.
+    ///
+    /// Queued requests are rejected with an error event before the thread
+    /// exits, so no client is left waiting on a pool that is going away.
+    fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.wakeup.notify_all();
+
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                warn!("the admission thread panicked");
+            }
+        }
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// The admission loop: waits for a slot, then serves the queue strictly FIFO.
+///
+/// The loop owns the registry lock only while it inspects or mutates state.
+/// Waiting happens in [`Condvar::wait_timeout`], which releases the lock; no
+/// request thread ever waits on a slot and no Tokio worker is blocked.
+fn admission_loop(
+    registry: Arc<Mutex<SlotRegistry>>,
+    active: Arc<AtomicUsize>,
+    wakeup: Arc<Condvar>,
+    enable_affinity: bool,
+    shutdown: Arc<AtomicBool>,
+    zero_capacity: Arc<AtomicBool>,
+) {
+    let registry_arc = registry;
+    let mut registry = lock_registry(&registry_arc);
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            reject_all_queued(&mut registry, "the inference pool is shutting down");
+            metrics::gauge!("synapse_queue_depth").set(0.0);
+            break;
+        }
+
+        expire_queued(&mut registry);
+        discard_disconnected(&mut registry);
+
+        // A fully retired pool can never serve a queued request again. Reject
+        // immediately instead of letting the requests sit until their timeout.
+        if registry.live == 0 && !registry.queue.is_empty() {
+            let rejected = registry.queue.len() as u64;
+            reject_all_queued(
+                &mut registry,
+                "the node has no live inference slots left (at capacity)",
+            );
+            metrics::counter!("synapse_queue_rejected_total", "reason" => "no_capacity")
+                .increment(rejected);
+            metrics::gauge!("synapse_queue_depth").set(0.0);
+            zero_capacity.store(true, Ordering::SeqCst);
+            registry = wait_on_wakeup(&wakeup, registry, ADMISSION_IDLE_WAIT);
+            continue;
+        }
+
+        if registry.queue.is_empty() {
+            // Nothing to dispatch. Enqueues and shutdown both notify, so this
+            // sleep is only a safety bound, not the primary wakeup path.
+            registry = wait_on_wakeup(&wakeup, registry, ADMISSION_IDLE_WAIT);
+            continue;
+        }
+
+        if registry.free.is_empty() {
+            // Every slot is busy. Wake at the head deadline at the latest so
+            // the timeout is enforced even when no generation finishes.
+            registry = wait_for_next(&wakeup, registry);
+            continue;
+        }
+
+        let Some(request) = registry.queue.pop_front() else {
+            continue;
+        };
+
+        // Re-check after the pop: the client may have disconnected or the
+        // deadline may have passed between the checks above and this point.
+        if request.token_sender.is_disconnected() {
+            metrics::gauge!("synapse_queue_depth").set(registry.queue.len() as f64);
+            continue;
+        }
+
+        if Instant::now() >= request.deadline {
+            let waited = request.queued_at.elapsed();
+            metrics::histogram!("synapse_queue_wait_ms").record(waited.as_secs_f64() * 1_000.0);
+            metrics::counter!("synapse_queue_rejected_total", "reason" => "timeout").increment(1);
+            let _ = request.token_sender.send(TokenEvent::Error {
+                message: "the request timed out waiting for an inference slot (queue timeout)"
+                    .to_owned(),
+            });
+            metrics::gauge!("synapse_queue_depth").set(registry.queue.len() as f64);
+            continue;
+        }
+
+        let Some((index, shared)) = registry.select(&request.tokens, enable_affinity) else {
+            // A free slot disappeared between the check and the selection.
+            // Put the request back at the front to preserve FIFO strictness.
+            registry.queue.push_front(request);
+            registry = wait_for_next(&wakeup, registry);
+            continue;
+        };
+
+        let prefill_from = shared.min(request.tokens.len().saturating_sub(1));
+        let Some(guard) = checkout_slot(&mut registry, index, &active, &registry_arc, &wakeup, &zero_capacity)
+        else {
+            registry.queue.push_front(request);
+            registry = wait_for_next(&wakeup, registry);
+            continue;
+        };
+
+        let waited = request.queued_at.elapsed();
+        let depth = registry.queue.len();
+        let tokens = request.tokens;
+        let max_tokens = request.max_tokens;
+        let token_sender = request.token_sender;
+
+        // The registry lock is released before the command is sent and before
+        // any metric is recorded; the slot is already reserved in the
+        // registry, so no other request can take it.
+        drop(registry);
+
+        metrics::gauge!("synapse_queue_depth").set(depth as f64);
+        metrics::histogram!("synapse_queue_wait_ms").record(waited.as_secs_f64() * 1_000.0);
+        metrics::counter!("synapse_queue_admitted_total").increment(1);
+
+        if enable_affinity && shared > 0 {
+            metrics::counter!("synapse_slot_affinity_matches_total").increment(1);
+        }
+
+        if let Err(err) = dispatch_command(guard, tokens, prefill_from, max_tokens, token_sender) {
+            warn!(%err, "a queued request could not be dispatched");
+        }
+
+        registry = lock_registry(&registry_arc);
+    }
+}
+
+/// Rejects every queued request with a terminal error event.
+///
+/// Used at shutdown and when the last live slot retires. Sending on an
+/// unbounded channel never blocks, so the registry lock stays short-lived.
+fn reject_all_queued(registry: &mut SlotRegistry, message: &str) {
+    while let Some(request) = registry.queue.pop_front() {
+        let _ = request.token_sender.send(TokenEvent::Error {
+            message: message.to_owned(),
+        });
+    }
+}
+
+/// Rejects requests whose deadline passed, starting at the FIFO head.
+///
+/// Deadlines are monotonic because they are computed from `Instant::now()` at
+/// enqueue time, so once the head is not expired no later entry is either.
+fn expire_queued(registry: &mut SlotRegistry) {
+    let now = Instant::now();
+
+    while registry
+        .queue
+        .front()
+        .is_some_and(|request| now >= request.deadline)
+    {
+        let Some(request) = registry.queue.pop_front() else {
+            break;
+        };
+
+        let waited = now.saturating_duration_since(request.queued_at);
+        metrics::histogram!("synapse_queue_wait_ms").record(waited.as_secs_f64() * 1_000.0);
+        metrics::counter!("synapse_queue_rejected_total", "reason" => "timeout").increment(1);
+        metrics::histogram!("synapse_queue_rejected_wait_ms", "reason" => "timeout")
+            .record(waited.as_secs_f64() * 1_000.0);
+        let _ = request.token_sender.send(TokenEvent::Error {
+            message: "the request timed out waiting for an inference slot (queue timeout)"
+                .to_owned(),
+        });
+    }
+
+    metrics::gauge!("synapse_queue_depth").set(registry.queue.len() as f64);
+}
+
+/// Drops queued requests whose client went away, starting at the FIFO head.
+fn discard_disconnected(registry: &mut SlotRegistry) {
+    while registry
+        .queue
+        .front()
+        .is_some_and(|request| request.token_sender.is_disconnected())
+    {
+        let _ = registry.queue.pop_front();
+    }
+
+    metrics::gauge!("synapse_queue_depth").set(registry.queue.len() as f64);
+}
+
+/// Waits until the head deadline, or for a release/enqueue notification.
+fn wait_for_next<'a>(
+    wakeup: &Condvar,
+    registry: MutexGuard<'a, SlotRegistry>,
+) -> MutexGuard<'a, SlotRegistry> {
+    let timeout = registry
+        .queue
+        .front()
+        .map_or(ADMISSION_IDLE_WAIT, |request| {
+            request
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1))
+        });
+
+    wait_on_wakeup(wakeup, registry, timeout)
+}
+
+/// Releases the registry lock and waits, handling a poisoned mutex normally.
+fn wait_on_wakeup<'a>(
+    wakeup: &Condvar,
+    registry: MutexGuard<'a, SlotRegistry>,
+    timeout: Duration,
+) -> MutexGuard<'a, SlotRegistry> {
+    match wakeup.wait_timeout(registry, timeout) {
+        Ok((guard, _)) => guard,
+        Err(poisoned) => poisoned.into_inner().0,
+    }
+}
+
 /// A fixed set of slots that share one model.
 ///
 /// The pool implements [`TokenStreamProvider`], so the networking layer is
 /// unchanged: it asks for a stream and gets one, or gets an error when the
-/// node is at capacity.
+/// node is at capacity and the queue is full.
 #[derive(Debug)]
 pub struct InferencePool {
-    /// The inspectable state of every slot.
+    /// The inspectable state of every slot and the admission queue.
     registry: Arc<Mutex<SlotRegistry>>,
     /// The number of slots that are currently serving a request.
     active: Arc<AtomicUsize>,
+    /// Wakes the admission thread when a slot is released or a request is
+    /// queued.
+    wakeup: Arc<Condvar>,
+    /// The admission thread, when the queue is enabled.
+    admission: Option<Admission>,
+    /// Maximum number of waiting requests. Zero disables the queue entirely.
+    queue_capacity: usize,
+    /// How long a queued request may wait before it is rejected.
+    queue_wait: Duration,
     /// The shared model. It is only used to tokenize prompts on the request
     /// path; the generation itself runs on the slot threads.
     model: Arc<LlamaModel>,
     /// Whether free slots are scored by their cached prefix.
     enable_affinity: bool,
+    /// Whether every live slot has retired.
+    zero_capacity: Arc<AtomicBool>,
     /// One command channel per slot, used to stop the threads at shutdown.
     slot_commands: Vec<Sender<SlotCommand>>,
     /// The threads of the slot loops.
@@ -398,12 +808,19 @@ impl InferencePool {
     /// an empty KV cache: the pool behaves exactly like it did before the
     /// prefix cache existed. When `enable_affinity_scheduling` is `false`,
     /// slot selection is the Phase 8 FIFO order and no prompt is scored.
+    ///
+    /// `queue_capacity` is the number of requests that may wait when every
+    /// slot is busy; `queue_wait_ms` bounds that wait. A capacity of zero
+    /// disables the queue and reproduces the Phase 9 reject-on-full behaviour
+    /// exactly.
     pub fn load(
         path: &str,
         max_capacity: u32,
         context_length: u32,
         enable_prefix_caching: bool,
         enable_affinity_scheduling: bool,
+        queue_capacity: usize,
+        queue_wait_ms: u64,
     ) -> Result<Self, SynapseError> {
         let capacity = usize::try_from(max_capacity).map_err(|_| {
             SynapseError::Engine("node.max_capacity does not fit into a usize".to_owned())
@@ -414,6 +831,8 @@ impl InferencePool {
                 "node.max_capacity has to be at least 1".to_owned(),
             ));
         }
+
+        let queue_wait = Duration::from_millis(queue_wait_ms);
 
         let backend = synapse_ffi::init_backend()?;
         let model = Arc::new(LlamaModel::load_from_file(backend, path)?);
@@ -434,6 +853,8 @@ impl InferencePool {
             kv_cache_mib_total = kv_mib_total,
             prefix_caching = enable_prefix_caching,
             affinity_scheduling = enable_affinity,
+            queue_capacity,
+            queue_wait_ms,
             "starting the inference pool"
         );
 
@@ -442,6 +863,8 @@ impl InferencePool {
         // The busy counter is shared between the guards (which are owned by
         // the slot threads) and the telemetry of the pool.
         let active = Arc::new(AtomicUsize::new(0));
+        let wakeup = Arc::new(Condvar::new());
+        let zero_capacity = Arc::new(AtomicBool::new(false));
 
         let params = context_params(context_length, capacity);
         let mut slot_commands = Vec::with_capacity(capacity);
@@ -452,6 +875,7 @@ impl InferencePool {
         let registry = Arc::new(Mutex::new(SlotRegistry {
             slots: Vec::with_capacity(capacity),
             free: (0..capacity).collect(),
+            queue: VecDeque::new(),
             live: capacity,
         }));
 
@@ -526,19 +950,47 @@ impl InferencePool {
         metrics::gauge!("synapse_active_generations").set(0.0);
         metrics::gauge!("synapse_capacity_total").set(capacity as f64);
         metrics::gauge!("synapse_capacity_live").set(capacity as f64);
+        metrics::gauge!("synapse_queue_depth").set(0.0);
+
+        let admission = if queue_capacity > 0 {
+            match Admission::spawn(
+                Arc::clone(&registry),
+                Arc::clone(&active),
+                Arc::clone(&wakeup),
+                enable_affinity,
+                Arc::clone(&zero_capacity),
+            ) {
+                Ok(admission) => Some(admission),
+                Err(err) => {
+                    stop_slots(&slot_commands, handles);
+                    return Err(SynapseError::Engine(format!(
+                        "failed to start the admission thread: {err}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
 
         info!(
             slots = capacity,
             prefix_caching = enable_prefix_caching,
             affinity_scheduling = enable_affinity,
+            queue_capacity,
+            queue_wait_ms,
             "inference pool is ready"
         );
 
         Ok(Self {
             registry,
             active,
+            wakeup,
+            admission,
+            queue_capacity,
+            queue_wait,
             model,
             enable_affinity,
+            zero_capacity,
             slot_commands,
             handles,
         })
@@ -553,9 +1005,19 @@ impl InferencePool {
         lock_registry(&self.registry).live
     }
 
+    /// Whether every live slot has retired.
+    pub fn all_retired(&self) -> bool {
+        self.zero_capacity.load(Ordering::Relaxed)
+    }
+
     /// The number of slots that are currently serving a request.
     pub fn active(&self) -> usize {
         self.active.load(Ordering::Relaxed)
+    }
+
+    /// The number of requests currently waiting for a slot.
+    pub fn queue_depth(&self) -> usize {
+        lock_registry(&self.registry).queue.len()
     }
 
     /// Tokenizes a prompt with the chat template of the loaded model.
@@ -620,93 +1082,158 @@ impl InferencePool {
             0
         };
 
-        let commands = match registry.slots.get_mut(index) {
-            Some(entry) if entry.status == SlotStatus::Free => {
-                entry.status = SlotStatus::Busy;
-                entry.commands.clone()
-            }
-            // Defensive: `select` only returns free slots, so this can only
-            // happen if the registry was corrupted. Reject instead of handing
-            // out a slot that may be busy.
-            _ => {
-                return Err(AtCapacity {
-                    capacity: registry.live,
-                });
-            }
+        // Defensive: `select` only returns free slots. If the registry were
+        // corrupted, reject instead of handing out a busy slot.
+        let Some(guard) = checkout_slot(
+            &mut registry,
+            index,
+            &self.active,
+            &self.registry,
+            &self.wakeup,
+            &self.zero_capacity,
+        ) else {
+            return Err(AtCapacity {
+                capacity: registry.live,
+            });
         };
-
-        // The busy counter is incremented under the registry lock, before the
-        // lock is dropped, so `active() == 0` implies that no slot is busy.
-        let busy = self.active.fetch_add(1, Ordering::AcqRel) + 1;
         drop(registry);
-
-        metrics::gauge!("synapse_active_generations").set(busy as f64);
 
         if affinity && shared > 0 {
             metrics::counter!("synapse_slot_affinity_matches_total").increment(1);
         }
 
-        Ok((
-            SlotGuard {
-                index,
-                commands,
-                registry: Arc::clone(&self.registry),
-                active: Arc::clone(&self.active),
-                released: false,
-            },
-            reusable,
-        ))
+        Ok((guard, reusable))
     }
 
     /// Starts a generation on a free slot.
     ///
     /// The prompt is tokenized before a slot is chosen, so the affinity score
-    /// compares the *incoming* prompt with every slot's cached prefix. The slot
-    /// guard travels with the command: the slot thread releases the slot when
-    /// the generation ends, whatever the reason.
+    /// compares the *incoming* prompt with every slot's cached prefix. With a
+    /// queue configured, the request is queued when every slot is busy and the
+    /// returned receiver stays silent until the admission thread assigns a
+    /// slot; a queue timeout arrives as a terminal [`TokenEvent::Error`].
+    /// The slot guard travels with the command: the slot thread releases the
+    /// slot when the generation ends, whatever the reason.
     fn start_generation(
         &self,
         prompt: String,
         max_tokens: usize,
     ) -> Result<Receiver<TokenEvent>, SynapseError> {
         let tokens = self.model.tokenize_prompt(&prompt)?;
-
-        let (guard, prefill_from) = self
-            .acquire_affine(&tokens)
-            .map_err(|err| SynapseError::Engine(err.to_string()))?;
-
-        let command_sender = guard.commands().clone();
         let (token_sender, token_receiver) = flume::unbounded::<TokenEvent>();
 
-        let command = SlotCommand::Generate {
-            tokens,
-            prefill_from,
-            max_tokens,
-            token_sender,
-            guard,
-        };
-
-        if command_sender.send(command).is_err() {
-            // Dropping the failed command drops the guard, which returns the
-            // slot to the free queue.
-            return Err(SynapseError::Engine(
-                "the inference slot thread is gone".to_owned(),
-            ));
+        if self.queue_capacity == 0 {
+            // Phase 9 path: no queue, no admission thread, immediate rejection.
+            let (guard, prefill_from) = self
+                .acquire_affine(&tokens)
+                .map_err(|err| SynapseError::Engine(err.to_string()))?;
+            dispatch_command(guard, tokens, prefill_from, max_tokens, token_sender)?;
+        } else {
+            // Capture the monotonic admission instant before any lock or enqueue
+            // attempt, so the deadline is not shortened by lock contention.
+            let queued_at = Instant::now();
+            self.acquire_or_enqueue(tokens, max_tokens, token_sender, queued_at)?;
         }
 
         Ok(token_receiver)
     }
 
-    /// Stops every slot thread and waits for them to exit.
+    /// Takes a free slot when the queue is empty, otherwise enqueues the
+    /// request behind the requests that are already waiting.
     ///
-    /// A slot that is serving a request finishes that request first; dropping
-    /// the receiver of the request aborts it instead.
+    /// The registry lock covers the decision, the queue mutation and the
+    /// status change only. It is released before a command is sent and is
+    /// never held while a request waits.
+    fn acquire_or_enqueue(
+        &self,
+        tokens: Vec<i32>,
+        max_tokens: usize,
+        token_sender: Sender<TokenEvent>,
+        queued_at: Instant,
+    ) -> Result<(), SynapseError> {
+        let mut registry = lock_registry(&self.registry);
+
+        // Fast path only when nobody is waiting. If the queue is non-empty a
+        // new request must not jump the FIFO even if a slot just became free.
+        if registry.queue.is_empty() {
+            if let Some((index, shared)) = registry.select(&tokens, self.enable_affinity) {
+                let reusable = shared.min(tokens.len().saturating_sub(1));
+                let Some(guard) = checkout_slot(
+                    &mut registry,
+                    index,
+                    &self.active,
+                    &self.registry,
+                    &self.wakeup,
+                    &self.zero_capacity,
+                ) else {
+                    return Err(SynapseError::Engine(
+                        "the inference registry returned an unusable slot".to_owned(),
+                    ));
+                };
+
+                drop(registry);
+
+                if self.enable_affinity && shared > 0 {
+                    metrics::counter!("synapse_slot_affinity_matches_total").increment(1);
+                }
+
+                return dispatch_command(guard, tokens, reusable, max_tokens, token_sender);
+            }
+        }
+
+        // A node whose slots were all retired cannot serve anything. Queueing
+        // would only make clients wait for a timeout.
+        if registry.live == 0 {
+            drop(registry);
+            return Err(SynapseError::Engine(
+                "the node has no live inference slots (at capacity)".to_owned(),
+            ));
+        }
+
+        if registry.queue.len() >= self.queue_capacity {
+            drop(registry);
+            metrics::counter!("synapse_queue_rejected_total", "reason" => "full").increment(1);
+            metrics::histogram!("synapse_queue_rejected_wait_ms", "reason" => "full")
+                .record(0.0);
+            return Err(SynapseError::Engine(
+                "the inference queue is full (queue full)".to_owned(),
+            ));
+        }
+
+        let deadline = queued_at.checked_add(self.queue_wait).unwrap_or(queued_at);
+        registry.queue.push_back(QueuedRequest {
+            tokens,
+            max_tokens,
+            token_sender,
+            queued_at,
+            deadline,
+        });
+        let depth = registry.queue.len();
+        drop(registry);
+
+        metrics::gauge!("synapse_queue_depth").set(depth as f64);
+        self.wakeup.notify_all();
+
+        Ok(())
+    }
+
+    /// Stops the admission thread and every slot thread, and waits for them.
+    ///
+    /// Queued requests are rejected with a terminal error event first. A slot
+    /// that is serving a request finishes that request before it exits;
+    /// dropping the receiver of the request aborts it instead.
     pub fn shutdown(self) -> Result<(), SynapseError> {
         let Self {
+            mut admission,
             slot_commands,
             handles,
             ..
         } = self;
+
+        if let Some(admission) = admission.as_mut() {
+            admission.stop();
+        }
+        drop(admission);
 
         for sender in &slot_commands {
             let _ = sender.send(SlotCommand::Shutdown);
@@ -1110,6 +1637,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(SlotRegistry {
             slots,
             free: (0..capacity).collect(),
+            queue: VecDeque::new(),
             live: capacity,
         }));
 
@@ -1142,6 +1670,8 @@ mod tests {
             commands,
             registry: Arc::clone(registry),
             active: Arc::clone(active),
+            wakeup: Arc::new(Condvar::new()),
+            zero_capacity: Arc::new(AtomicBool::new(false)),
             released: false,
         }
     }

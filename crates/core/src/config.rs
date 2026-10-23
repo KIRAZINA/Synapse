@@ -51,7 +51,7 @@ listen_addr = "/ip4/0.0.0.0/tcp/0"
 # own inference context and KV cache and runs on its own thread, so raising
 # this really enables concurrent serving. It is bounded by memory: each slot
 # adds roughly one KV cache on top of the model. Requests that arrive while
-# every slot is busy are rejected immediately; they are never queued.
+# every slot is busy wait in the bounded queue configured in [pool].
 max_capacity = 1
 
 [model]
@@ -95,11 +95,21 @@ enable_prefix_caching = true
 
 # Prefer a free slot whose cached prompt prefix best matches the incoming
 # prompt. The prompt is tokenized before a slot is chosen, and only the
-# slot with the longest common prefix is taken. A busy slot is never waited
-# for: if every slot is busy the request is still rejected immediately. This
-# only avoids a cold slot; it never changes the output. Disable it to get the
+# slot with the longest common prefix is taken. When every slot is busy the
+# request waits in the [pool] queue; affinity only chooses which free slot a
+# dequeued request receives, never the queue order. Disable it to get the
 # Phase 8 behaviour of taking the oldest free slot.
 enable_affinity_scheduling = true
+
+[pool]
+# Maximum number of requests that may wait for a free inference slot. Dispatch
+# is strict FIFO. Set this to 0 to disable queueing: every request that finds
+# all slots busy is rejected immediately, which is the Phase 9 behaviour.
+queue_capacity = 8
+
+# Maximum time, in milliseconds, that a queued request waits before it is
+# rejected with a "queue timeout" error event.
+queue_wait_ms = 5000
 
 [bootstrap]
 # Multiaddrs of the peers that are dialed at start up.
@@ -169,8 +179,62 @@ pub struct Config {
     pub metrics: MetricsConfig,
     /// The prompt prefix cache of the inference slots.
     pub cache: CacheConfig,
+    /// The admission queue of the inference slots.
+    pub pool: PoolConfig,
+    /// The authentication and authorization policy.
+    pub security: SecurityConfig,
     /// The peers that are dialed at start up.
     pub bootstrap: BootstrapConfig,
+}
+
+/// The authentication and authorization policy of the node.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// "open" (explicit dev only) or "allowlist".
+    pub mode: String,
+    /// Milliseconds to wait for an AUTH frame before closing.
+    pub auth_timeout_ms: u64,
+    /// Lifetime of an issued nonce, in milliseconds.
+    pub nonce_ttl_ms: u64,
+    /// Whether loopback peers are admitted without listing.
+    pub allow_loopback: bool,
+    /// Access control lists and quotas.
+    pub access: SecurityAccessConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            mode: "allowlist".to_owned(),
+            auth_timeout_ms: 5_000,
+            nonce_ttl_ms: 30_000,
+            allow_loopback: true,
+            access: SecurityAccessConfig::default(),
+        }
+    }
+}
+
+/// Access control lists and per-peer quotas.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityAccessConfig {
+    /// libp2p PeerId strings that are allowed to use this node.
+    pub trusted_peers: Vec<String>,
+    /// Maximum concurrent generations per authenticated peer.
+    pub per_peer_concurrency: usize,
+    /// Rolling 60s budget of requested max_tokens per peer.
+    pub per_peer_tokens_per_minute: u64,
+}
+
+impl Default for SecurityAccessConfig {
+    fn default() -> Self {
+        Self {
+            trusted_peers: Vec::new(),
+            per_peer_concurrency: 1,
+            per_peer_tokens_per_minute: 4096,
+        }
+    }
 }
 
 impl Config {
@@ -398,8 +462,9 @@ pub struct CacheConfig {
     ///
     /// The prompt is tokenized before the slot is selected and every free
     /// slot's cached prefix is scored by the length of the common prefix. The
-    /// best free slot wins; a busy slot is never waited for. When this is
-    /// `false`, the oldest free slot is taken, which is the Phase 8 behaviour.
+    /// best free slot wins; when every slot is busy the request waits in the
+    /// admission queue. When this is `false`, the oldest free slot is taken,
+    /// which is the Phase 8 behaviour.
     pub enable_affinity_scheduling: bool,
 }
 
@@ -408,6 +473,29 @@ impl Default for CacheConfig {
         Self {
             enable_prefix_caching: true,
             enable_affinity_scheduling: true,
+        }
+    }
+}
+
+/// The bounded admission queue of the inference slots.
+///
+/// A request that finds every slot busy waits here, in strict FIFO order, for
+/// at most [`queue_wait_ms`](Self::queue_wait_ms). A capacity of zero disables
+/// the queue and restores immediate reject-on-full.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PoolConfig {
+    /// Maximum number of requests that may wait for a slot.
+    pub queue_capacity: usize,
+    /// Maximum time a queued request waits before it is rejected, in ms.
+    pub queue_wait_ms: u64,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: 8,
+            queue_wait_ms: 5_000,
         }
     }
 }
@@ -441,6 +529,8 @@ mod tests {
         assert_eq!(config.metrics.port, 9090);
         assert!(config.cache.enable_prefix_caching);
         assert!(config.cache.enable_affinity_scheduling);
+        assert_eq!(config.pool.queue_capacity, 8);
+        assert_eq!(config.pool.queue_wait_ms, 5_000);
         assert!(config.bootstrap.peers.is_empty());
         assert!(config.validate().is_ok());
     }
@@ -463,6 +553,16 @@ mod tests {
 
         assert!(config.cache.enable_prefix_caching);
         assert!(!config.cache.enable_affinity_scheduling);
+        assert_eq!(config.node, Config::default().node);
+    }
+
+    #[test]
+    fn the_queue_can_be_disabled() {
+        let config = Config::from_toml_str("[pool]\nqueue_capacity = 0\nqueue_wait_ms = 250\n")
+            .unwrap_or_else(|err| panic!("the pool section does not parse: {err}"));
+
+        assert_eq!(config.pool.queue_capacity, 0);
+        assert_eq!(config.pool.queue_wait_ms, 250);
         assert_eq!(config.node, Config::default().node);
     }
 

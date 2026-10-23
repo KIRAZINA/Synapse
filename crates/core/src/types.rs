@@ -96,7 +96,12 @@ pub struct NodeTelemetry {
 pub trait TokenStreamProvider: Send + Sync + 'static {
     /// Starts a streaming generation and returns the receiver of its events.
     ///
-    /// Dropping the receiver aborts the generation.
+    /// The call may return before a slot is assigned: when the provider has a
+    /// bounded admission queue, the request waits there and its events begin
+    /// once a slot frees. A rejection before enqueue is returned as `Err`; a
+    /// timeout after enqueue is a terminal [`TokenEvent::Error`]. Dropping the
+    /// receiver aborts the generation, including a request that is still
+    /// waiting in the queue.
     fn generate_streaming(
         &self,
         prompt: String,
