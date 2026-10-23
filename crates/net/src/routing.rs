@@ -19,6 +19,8 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(15);
 pub struct RoutingTable {
     /// The telemetry of the peers.
     peers: DashMap<PeerId, NodeTelemetry>,
+    /// Reputation scores per peer.
+    reputation_scores: DashMap<String, f64>,
     /// How long a telemetry entry stays valid.
     ttl: Duration,
 }
@@ -39,6 +41,7 @@ impl RoutingTable {
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             peers: DashMap::new(),
+            reputation_scores: DashMap::new(),
             ttl,
         }
     }
@@ -69,6 +72,17 @@ impl RoutingTable {
         let telemetry = decode_telemetry(payload, source)?;
         self.update(source, telemetry.clone());
         Ok(telemetry)
+    }
+
+    /// Updates the reputation of a peer.
+    pub fn update_reputation(&self, peer: &str, delta: f64) {
+        let mut entry = self.reputation_scores.entry(peer.to_owned()).or_insert(0.0);
+        *entry += delta;
+    }
+
+    /// The reputation of a peer.
+    pub fn reputation(&self, peer: &str) -> f64 {
+        self.reputation_scores.get(peer).map(|v| *v).unwrap_or(0.0)
     }
 
     /// The number of peers in the table.
@@ -116,6 +130,11 @@ impl RoutingTable {
             .min_by(|left, right| {
                 left.active_requests
                     .cmp(&right.active_requests)
+                    .then_with(|| {
+                        let lr = self.reputation(&left.peer_id);
+                        let rr = self.reputation(&right.peer_id);
+                        rr.partial_cmp(&lr).unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .then_with(|| left.peer_id.cmp(&right.peer_id))
             })
     }
