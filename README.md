@@ -252,3 +252,8 @@ reasons, FIFO dispatch order, a client that disconnects while queued, the
 `queue_capacity = 0` Phase 9 regression, and a 20-request stress burst. The
 affinity comparison prints the hit count, saved tokens and affinity matches for
 the enabled and disabled paths.
+
+## Security
+
+Modes: allowlist (default) or open (dev only, logs warning). allow_loopback defaults false. Nonce lifecycle: issue -> consume -> expire. Quotas: per_peer_concurrency, per_peer_tokens_per_minute (rolling 60s), max_tokens_per_request. Authentication proves identity, not compute correctness.
+
