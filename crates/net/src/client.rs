@@ -13,6 +13,7 @@ use synapse_core::{SynapseError, TokenEvent};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+use libp2p::identity;
 use crate::transport::{build_client_config, SERVER_NAME};
 use crate::wire;
 
@@ -40,12 +41,11 @@ impl AbortHandle {
 /// A client that runs a generation on a remote Synapse node.
 #[derive(Debug, Clone)]
 pub struct RemoteInferenceClient {
-    /// The local QUIC endpoint.
     endpoint: Endpoint,
-    /// The QUIC address of the remote node.
     addr: SocketAddr,
-    /// The DER encoded certificate of the remote node.
     cert_der: Vec<u8>,
+    keypair: identity::Keypair,
+    nonce: [u8; 32],
 }
 
 impl RemoteInferenceClient {
@@ -54,7 +54,7 @@ impl RemoteInferenceClient {
     /// The certificate is the one the remote node published over the control
     /// plane; it is pinned, so the connection is only accepted when the
     /// remote node owns the matching private key.
-    pub fn new(addr: SocketAddr, cert_der: Vec<u8>) -> Result<Self, SynapseError> {
+    pub fn new(addr: SocketAddr, cert_der: Vec<u8>, keypair: identity::Keypair, nonce: [u8; 32]) -> Result<Self, SynapseError> {
         crate::transport::install_crypto_provider();
 
         let bind_addr: SocketAddr = ([0, 0, 0, 0], 0).into();
@@ -66,6 +66,8 @@ impl RemoteInferenceClient {
             endpoint,
             addr,
             cert_der,
+            keypair,
+            nonce,
         })
     }
 
@@ -100,6 +102,28 @@ impl RemoteInferenceClient {
             ))
         })?;
         info!(addr = %self.addr, "quic connection established");
+
+        // AUTH first.
+        {
+            let (mut send, mut recv) = connection.open_bi().await.map_err(|err| {
+                SynapseError::Network(format!("failed to open auth stream: {err}"))
+            })?;
+            let peer_id_bytes = self.keypair.public().to_peer_id().to_bytes();
+            let pk_bytes = self.keypair.public().encode_protobuf();
+            let msg = {
+                let mut m = Vec::with_capacity(16 + 32 + peer_id_bytes.len());
+                m.extend_from_slice(b"synapse-auth-v1");
+                m.extend_from_slice(&self.nonce);
+                m.extend_from_slice(&peer_id_bytes);
+                m
+            };
+            let sig = self.keypair.sign(&msg).map_err(|err| SynapseError::Network(format!("sign failed: {err}")))?;
+            wire::write_auth(&mut send, &peer_id_bytes, &pk_bytes, &self.nonce, &sig).await.map_err(|err| {
+                SynapseError::Network(format!("failed to send auth: {err}"))
+            })?;
+            let _ = send.finish();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), recv.read_to_end(0)).await;
+        }
 
         let (mut send, mut recv) = connection
             .open_bi()

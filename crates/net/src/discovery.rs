@@ -171,6 +171,10 @@ pub struct HandshakeResponse {
     pub quic_port: u16,
     /// The DER encoded certificate of the peer.
     pub quic_cert_der: Vec<u8>,
+    /// Single-use nonce for QUIC data-plane authentication.
+    pub auth_nonce: [u8; 32],
+    /// Expiry of the nonce, in milliseconds since epoch.
+    pub auth_expires_at_ms: u64,
 }
 
 /// The combined behaviour of the control plane.
@@ -229,10 +233,17 @@ impl SynapseBehaviour {
 
 /// Handles an inbound handshake request by answering with the local QUIC
 /// endpoint information.
-pub fn handshake_response(quic_port: u16, quic_cert_der: &[u8]) -> HandshakeResponse {
+pub fn handshake_response(
+    quic_port: u16,
+    quic_cert_der: &[u8],
+    auth_nonce: [u8; 32],
+    auth_expires_at_ms: u64,
+) -> HandshakeResponse {
     HandshakeResponse {
         quic_port,
         quic_cert_der: quic_cert_der.to_vec(),
+        auth_nonce,
+        auth_expires_at_ms,
     }
 }
 
@@ -294,7 +305,7 @@ pub fn ip_from_multiaddr(address: &Multiaddr) -> Option<IpAddr> {
 /// The swarm that is built here is only used to reach the peer: the
 /// generation itself travels over the QUIC data plane, which is completely
 /// independent of the control plane.
-pub async fn fetch_quic_info(target: &Multiaddr) -> Result<(SocketAddr, Vec<u8>), SynapseError> {
+pub async fn fetch_quic_info(target: &Multiaddr) -> Result<(SocketAddr, Vec<u8>, [u8; 32], u64), SynapseError> {
     let keypair = identity::Keypair::generate_ed25519();
     let behaviour = SynapseBehaviour::new(&keypair)?;
 
@@ -362,6 +373,8 @@ pub async fn fetch_quic_info(target: &Multiaddr) -> Result<(SocketAddr, Vec<u8>)
                 return Ok((
                     SocketAddr::new(ip, response.quic_port),
                     response.quic_cert_der,
+                    response.auth_nonce,
+                    response.auth_expires_at_ms,
                 ));
             }
             _ => {}
@@ -742,7 +755,7 @@ pub async fn run_discovery(
                     message: request_response::Message::Request { channel, .. },
                 },
             )) => {
-                let response = handshake_response(quic_port, &quic_cert_der);
+                let response = handshake_response(quic_port, &quic_cert_der, [0u8; 32], 0);
                 if swarm
                     .behaviour_mut()
                     .request_response

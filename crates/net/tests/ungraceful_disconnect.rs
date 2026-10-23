@@ -127,9 +127,15 @@ async fn start_server(
     let transport = QuicTransport::new().await?;
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, transport.local_port()));
 
+    let security = synapse_core::SecurityConfig {
+        allow_loopback: true,
+        ..Default::default()
+    };
     let server = InferenceServer::new(
         transport.endpoint().clone(),
         provider as Arc<dyn TokenStreamProvider>,
+        security,
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     );
     tokio::spawn(server.run());
 
@@ -274,7 +280,8 @@ async fn the_client_abort_handle_aborts_the_generation() -> Result<(), Box<dyn s
     let provider = Arc::new(SlowProvider::new());
     let (transport, server_addr) = start_server(Arc::clone(&provider) as Arc<_>).await?;
 
-    let client = RemoteInferenceClient::new(server_addr, transport.cert_der().to_vec())?;
+    let keypair = synapse_net::generate_keypair();
+    let client = RemoteInferenceClient::new(server_addr, transport.cert_der().to_vec(), keypair, [0u8; 32])?;
     let (events, abort) = client.generate("hello".to_owned(), MAX_TOKENS).await?;
 
     // Wait for the first tokens, so that the generation is really running.

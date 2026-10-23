@@ -112,6 +112,10 @@ async fn run() -> Result<()> {
     // context (or its KV cache) any more.
     let pool = Arc::new(load_pool(&config)?);
 
+    if config.security.mode == "open" {
+        warn!("SECURITY: mode=open — authentication/allowlist is DISABLED; any peer can use this node");
+    }
+
     info!(
         max_capacity = pool.capacity(),
         context_length = config.model.context_length,
@@ -328,6 +332,7 @@ fn network_settings(
         bootstrap,
         transport,
         served_models,
+        security: config.security.clone(),
     })
 }
 
@@ -384,9 +389,10 @@ async fn forward_prompt(
     let target = parse_bootstrap(target)?;
 
     info!(%target, "requesting the quic endpoint of the remote node");
-    let (addr, cert_der) = fetch_quic_info(&target).await?;
+    let (addr, cert_der, nonce, _expiry) = fetch_quic_info(&target).await?;
 
-    let client = RemoteInferenceClient::new(addr, cert_der)?;
+    let keypair = synapse_net::generate_keypair();
+    let client = RemoteInferenceClient::new(addr, cert_der, keypair, nonce)?;
     let (events, abort) = client.generate(prompt.to_owned(), max_tokens).await?;
 
     let request_started = Instant::now();

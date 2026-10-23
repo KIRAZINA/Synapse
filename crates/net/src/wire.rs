@@ -29,6 +29,9 @@ pub const CMD_GENERATE: u8 = 0x01;
 /// Command: the data plane smoke test.
 pub const CMD_PING: u8 = 0x02;
 
+/// Command: authenticate the connection.
+pub const CMD_AUTH: u8 = 0x03;
+
 /// Event: a generated token.
 pub const EVT_TOKEN: u8 = 0x01;
 
@@ -37,6 +40,9 @@ pub const EVT_DONE: u8 = 0x02;
 
 /// Event: the generation failed.
 pub const EVT_ERROR: u8 = 0x03;
+
+/// Event: authentication rejected.
+pub const EVT_AUTH_REJECTED: u8 = 0x04;
 
 /// Largest prompt that is accepted, in bytes.
 pub const MAX_PROMPT_BYTES: usize = 1024 * 1024;
@@ -255,4 +261,57 @@ pub fn stop_reason_from_u8(value: u8) -> io::Result<StopReason> {
             format!("unknown stop reason {other:#04x}"),
         )),
     }
+}
+
+/// Writes an AUTH frame.
+pub async fn write_auth<W>(writer: &mut W, client_peer_id: &[u8], public_key: &[u8], nonce: &[u8; 32], signature: &[u8]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut frame = Vec::with_capacity(1 + 2 + client_peer_id.len() + 2 + public_key.len() + 32 + 2 + signature.len());
+    frame.push(CMD_AUTH);
+    frame.extend_from_slice(&(client_peer_id.len() as u16).to_be_bytes());
+    frame.extend_from_slice(client_peer_id);
+    frame.extend_from_slice(&(public_key.len() as u16).to_be_bytes());
+    frame.extend_from_slice(public_key);
+    frame.extend_from_slice(nonce);
+    frame.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+    frame.extend_from_slice(signature);
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Reads an AUTH frame body.
+pub async fn read_auth<R>(reader: &mut R) -> io::Result<(Vec<u8>, Vec<u8>, [u8; 32], Vec<u8>)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut pid_len = [0u8; 2];
+    reader.read_exact(&mut pid_len).await?;
+    let pid_len = u16::from_be_bytes(pid_len) as usize;
+    if pid_len > 256 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "peer id too long"));
+    }
+    let mut pid = vec![0u8; pid_len];
+    reader.read_exact(&mut pid).await?;
+    let mut pk_len = [0u8; 2];
+    reader.read_exact(&mut pk_len).await?;
+    let pk_len = u16::from_be_bytes(pk_len) as usize;
+    if pk_len > 1024 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "public key too long"));
+    }
+    let mut pk = vec![0u8; pk_len];
+    reader.read_exact(&mut pk).await?;
+    let mut nonce = [0u8; 32];
+    reader.read_exact(&mut nonce).await?;
+    let mut sig_len = [0u8; 2];
+    reader.read_exact(&mut sig_len).await?;
+    let sig_len = u16::from_be_bytes(sig_len) as usize;
+    if sig_len > 1024 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "signature too long"));
+    }
+    let mut sig = vec![0u8; sig_len];
+    reader.read_exact(&mut sig).await?;
+    Ok((pid, pk, nonce, sig))
 }

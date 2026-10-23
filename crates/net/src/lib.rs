@@ -24,11 +24,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+type NonceStore = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], (PeerId, u64)>>>;
+
 use futures_util::StreamExt;
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{identity, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
-use synapse_core::{NodeTelemetry, SynapseError, TokenStreamProvider};
+use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
+use synapse_core::{NodeTelemetry, SecurityConfig, SynapseError, TokenStreamProvider};
 use tracing::{debug, info, warn};
 
 use crate::discovery::{
@@ -39,10 +41,11 @@ use crate::routing::{encode_telemetry, now_ms, RoutingTable};
 use crate::server::InferenceServer;
 use crate::transport::{QuicTransport, TransportSettings};
 
-pub use libp2p::Multiaddr as PeerMultiaddr;
+
 
 /// How often the telemetry of a node is broadcast.
 pub const TELEMETRY_INTERVAL: Duration = Duration::from_secs(5);
+pub use libp2p::Multiaddr as PeerMultiaddr;
 
 /// The models a node has actually loaded.
 ///
@@ -103,6 +106,8 @@ pub struct NetworkSettings {
     pub transport: TransportSettings,
     /// The models the node has loaded and may advertise.
     pub served_models: Arc<ServedModels>,
+    /// The security policy of the node.
+    pub security: SecurityConfig,
 }
 
 /// A Synapse node that takes part in the peer to peer network.
@@ -125,6 +130,10 @@ pub struct NetworkNode {
     served_models: Arc<ServedModels>,
     /// The addresses of the peers that are connected over libp2p.
     peer_addresses: HashMap<PeerId, SocketAddr>,
+    /// Nonces issued for QUIC data-plane authentication.
+    nonce_store: NonceStore,
+    /// The security policy of the node.
+    security: SecurityConfig,
 }
 
 impl NetworkNode {
@@ -133,7 +142,7 @@ impl NetworkNode {
         settings: NetworkSettings,
         provider: Arc<dyn TokenStreamProvider>,
     ) -> Result<Self, SynapseError> {
-        let keypair = identity::Keypair::generate_ed25519();
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
         let peer_id = keypair.public().to_peer_id();
 
         let behaviour = SynapseBehaviour::new(&keypair)?;
@@ -142,7 +151,7 @@ impl NetworkNode {
             .with_tokio()
             .with_tcp(
                 tcp::Config::default().nodelay(true),
-                |key: &identity::Keypair| noise::Config::new(key),
+                |key: &libp2p::identity::Keypair| noise::Config::new(key),
                 yamux::Config::default,
             )
             .map_err(|err| {
@@ -173,6 +182,8 @@ impl NetworkNode {
             bootstrap: settings.bootstrap,
             served_models: settings.served_models,
             peer_addresses: HashMap::new(),
+            nonce_store: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            security: settings.security,
         })
     }
 
@@ -237,7 +248,12 @@ impl NetworkNode {
         // The data plane runs in its own task: the swarm loop must never be
         // blocked by a QUIC operation. The server hands the generation
         // requests to the inference provider.
-        let server = InferenceServer::new(self.quic.endpoint().clone(), Arc::clone(&self.provider));
+        let server = InferenceServer::new(
+            self.quic.endpoint().clone(),
+            Arc::clone(&self.provider),
+            self.security.clone(),
+            Arc::clone(&self.nonce_store),
+        );
         tokio::spawn(async move {
             server.run().await;
         });
@@ -380,8 +396,27 @@ impl NetworkNode {
                 message,
             }) => match message {
                 request_response::Message::Request { channel, .. } => {
-                    let response =
-                        discovery::handshake_response(self.quic.local_port(), self.quic.cert_der());
+                    // Issue a single-use nonce bound to this peer's identity.
+                    let mut nonce = [0u8; 32];
+                    let _ = getrandom::getrandom(&mut nonce);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let expiry = now_ms.saturating_add(self.security.nonce_ttl_ms);
+                    if let Ok(mut store) = self.nonce_store.lock() {
+                        // Bound the store: evict expired entries first.
+                        store.retain(|_, (_, exp)| *exp > now_ms);
+                        if store.len() < 1024 {
+                            store.insert(nonce, (peer, expiry));
+                        }
+                    }
+                    let response = discovery::handshake_response(
+                        self.quic.local_port(),
+                        self.quic.cert_der(),
+                        nonce,
+                        expiry,
+                    );
                     if self
                         .swarm
                         .behaviour_mut()
@@ -531,4 +566,10 @@ impl NetworkNode {
             }
         });
     }
+}
+
+
+/// Generates a fresh libp2p keypair for data-plane authentication.
+pub fn generate_keypair() -> libp2p::identity::Keypair {
+    libp2p::identity::Keypair::generate_ed25519()
 }

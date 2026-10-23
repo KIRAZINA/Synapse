@@ -163,9 +163,10 @@ async fn chat_discover(
         .ok_or_else(|| anyhow::anyhow!("the selected peer did not publish a reachable address"))?;
 
     info!(%address, "requesting the quic endpoint of the selected peer");
-    let (addr, cert_der) = fetch_quic_info(&address).await?;
+    let (addr, cert_der, nonce, _expiry) = fetch_quic_info(&address).await?;
 
-    let client = RemoteInferenceClient::new(addr, cert_der)?;
+    let keypair = synapse_net::generate_keypair();
+    let client = RemoteInferenceClient::new(addr, cert_der, keypair, nonce)?;
     let (events, abort) = client.generate(prompt.to_owned(), max_tokens).await?;
 
     print_events(events, abort, &mut shutdown).await
@@ -206,9 +207,10 @@ async fn chat_remote(
     let target = parse_bootstrap(target)?;
 
     info!(%target, "requesting the quic endpoint of the remote node");
-    let (addr, cert_der) = fetch_quic_info(&target).await?;
+    let (addr, cert_der, nonce, _expiry) = fetch_quic_info(&target).await?;
 
-    let client = RemoteInferenceClient::new(addr, cert_der)?;
+    let keypair = synapse_net::generate_keypair();
+    let client = RemoteInferenceClient::new(addr, cert_der, keypair, nonce)?;
     let (events, abort) = client.generate(prompt.to_owned(), max_tokens).await?;
 
     print_events(events, abort, &mut shutdown).await

@@ -9,6 +9,6 @@ pub mod types;
 
 pub use config::{
     BootstrapConfig, Config, ConfigError, MetricsConfig, ModelConfig, NodeConfig, QuicConfig,
-    DEFAULT_CONFIG_FILE,
+    SecurityConfig, DEFAULT_CONFIG_FILE,
 };
 pub use types::{NodeTelemetry, Prompt, StopReason, SynapseError, TokenEvent, TokenStreamProvider};

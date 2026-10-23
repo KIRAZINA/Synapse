@@ -20,3 +20,4 @@ futures-util.workspace = true
 flume.workspace = true
 bincode.workspace = true
 dashmap.workspace = true
+getrandom = "0.2"

@@ -23,13 +23,16 @@
 //! * the connection closes, which the QUIC idle timeout reports for a peer
 //!   that simply stopped answering.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
-use synapse_core::{SynapseError, TokenEvent, TokenStreamProvider};
+use synapse_core::{SecurityConfig, SynapseError, TokenEvent, TokenStreamProvider};
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, warn};
+
+type NonceStore = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], (libp2p::PeerId, u64)>>>;
 
 use crate::wire;
 
@@ -44,16 +47,20 @@ const TERMINAL_EVENT_GRACE: Duration = Duration::from_secs(5);
 /// The QUIC server that serves generation requests.
 #[derive(Clone)]
 pub struct InferenceServer {
-    /// The endpoint the server accepts connections on.
     endpoint: Endpoint,
-    /// The provider of the token streams.
     provider: Arc<dyn TokenStreamProvider>,
+    security: SecurityConfig,
+    nonce_store: NonceStore,
 }
 
 impl InferenceServer {
-    /// Builds a server for the given endpoint and provider.
-    pub fn new(endpoint: Endpoint, provider: Arc<dyn TokenStreamProvider>) -> Self {
-        Self { endpoint, provider }
+    pub fn new(
+        endpoint: Endpoint,
+        provider: Arc<dyn TokenStreamProvider>,
+        security: SecurityConfig,
+        nonce_store: NonceStore,
+    ) -> Self {
+        Self { endpoint, provider, security, nonce_store }
     }
 
     /// Accepts connections until the endpoint is closed.
@@ -63,13 +70,15 @@ impl InferenceServer {
     pub async fn run(self) {
         while let Some(incoming) = self.endpoint.accept().await {
             let provider = Arc::clone(&self.provider);
+            let security = self.security.clone();
+            let nonce_store = Arc::clone(&self.nonce_store);
 
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(connection) => {
                         let remote = connection.remote_address();
                         info!(%remote, "quic connection accepted");
-                        handle_connection(provider, connection).await;
+                        handle_connection(provider, connection, security, nonce_store).await;
                     }
                     Err(err) => {
                         warn!("failed to establish the incoming quic connection: {err}");
@@ -86,61 +95,74 @@ impl InferenceServer {
 /// reason, every generation that is running on it is aborted. Each stream is
 /// served in its own task, so one slow generation does not stop the
 /// connection from accepting the next stream.
-async fn handle_connection(provider: Arc<dyn TokenStreamProvider>, connection: Connection) {
+async fn handle_connection(
+    provider: Arc<dyn TokenStreamProvider>,
+    connection: Connection,
+    security: SecurityConfig,
+    nonce_store: NonceStore,
+) {
     let remote = connection.remote_address();
-
-    // `watch` is used instead of `Notify` because it remembers the
-    // cancellation: a stream that is accepted just before the connection is
-    // closed still observes it. The channel is closed as well when this task
-    // ends, which is a cancellation of its own.
     let (cancel_sender, cancel_receiver) = watch::channel(false);
+    let auth_state = Arc::new(tokio::sync::Mutex::new((false, None::<libp2p::PeerId>)));
+    let allow_loopback = security.allow_loopback && remote.ip().is_loopback();
+
+    // Auth timeout task.
+    if !allow_loopback {
+        let conn = connection.clone();
+        let state = Arc::clone(&auth_state);
+        let timeout = Duration::from_millis(security.auth_timeout_ms);
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            if !state.lock().await.0 {
+                conn.close(quinn::VarInt::from_u32(1), b"auth timeout");
+            }
+        });
+    } else {
+        // loopback bypass: mark authenticated
+        let mut s = auth_state.lock().await;
+        s.0 = true;
+    }
 
     loop {
         tokio::select! {
-            // The closure is checked first: a closed connection makes both
-            // branches ready at the same time, and the reason of the closure
-            // is the useful message.
             biased;
-
             reason = connection.closed() => {
-                // The peer is gone: gracefully, by an idle timeout while it
-                // kept quiet, or by being killed. Nobody is waiting for the
-                // tokens of this connection any more.
                 info!(%remote, reason = %reason, "the quic connection closed");
                 break;
             }
             stream = connection.accept_bi() => {
                 let (send, recv) = match stream {
-                    Ok(stream) => stream,
-                    Err(err) => {
-                        info!(%remote, "failed to accept a quic stream: {err}");
-                        break;
-                    }
+                    Ok(s) => s,
+                    Err(err) => { info!(%remote, "failed to accept stream: {err}"); break; }
                 };
-
                 let provider = Arc::clone(&provider);
                 let cancelled = cancel_receiver.clone();
-
+                let auth_state = Arc::clone(&auth_state);
+                let security = security.clone();
+                let nonce_store = Arc::clone(&nonce_store);
                 tokio::spawn(async move {
-                    if let Err(err) = handle_stream(provider, send, recv, cancelled).await {
-                        warn!(%remote, "the quic stream failed: {err}");
+                    if let Err(err) = handle_stream(provider, send, recv, cancelled, auth_state, security, allow_loopback, remote, nonce_store).await {
+                        warn!(%remote, "stream failed: {err}");
                     }
                 });
             }
         }
     }
-
-    // Cancelling the token aborts every generation that still runs on this
-    // connection, including the ones whose client died without saying goodbye.
     let _ = cancel_sender.send(true);
 }
 
 /// Handles a single stream: dispatches the command and serves it.
+#[allow(clippy::too_many_arguments, clippy::collapsible_if)]
 async fn handle_stream(
     provider: Arc<dyn TokenStreamProvider>,
     mut send: SendStream,
     mut recv: RecvStream,
     cancelled: watch::Receiver<bool>,
+    auth_state: Arc<tokio::sync::Mutex<(bool, Option<libp2p::PeerId>)>>,
+    security: SecurityConfig,
+    allow_loopback: bool,
+    remote: SocketAddr,
+    nonce_store: NonceStore,
 ) -> Result<(), SynapseError> {
     // The command byte decides which protocol is spoken on the stream.
     let mut command = [0_u8; 1];
@@ -149,7 +171,87 @@ async fn handle_stream(
         .map_err(|err| SynapseError::Network(format!("failed to read the command: {err}")))?;
 
     match command[0] {
+        wire::CMD_AUTH => {
+            if allow_loopback {
+                let mut s = auth_state.lock().await;
+                s.0 = true;
+                let _ = send.finish();
+                return Ok(());
+            }
+            let (pid_bytes, pk_bytes, nonce, sig) = wire::read_auth(&mut recv).await.map_err(|err| {
+                SynapseError::Network(format!("failed to read auth: {err}"))
+            })?;
+            // verify
+            let claimed = match libp2p::PeerId::from_bytes(&pid_bytes) {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!(%remote, "auth: bad peer id");
+                    return Err(SynapseError::Network("bad peer id".into()));
+                }
+            };
+            let pk = match libp2p::identity::PublicKey::try_decode_protobuf(&pk_bytes) {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!(%remote, "auth: bad public key");
+                    return Err(SynapseError::Network("bad public key".into()));
+                }
+            };
+            if pk.to_peer_id() != claimed {
+                warn!(%remote, "auth: peer id mismatch");
+                return Err(SynapseError::Network("peer id mismatch".into()));
+            }
+            // nonce lookup
+            let issued = {
+                let mut store = nonce_store.lock().unwrap_or_else(|e| e.into_inner());
+                store.remove(&nonce)
+            };
+            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+            let mut ok = false;
+            if let Some((issued_peer, expiry)) = issued {
+                if expiry >= now_ms {
+                    if issued_peer == claimed {
+                        // verify signature
+                        let mut msg = Vec::with_capacity(16 + 32 + pid_bytes.len());
+                        msg.extend_from_slice(b"synapse-auth-v1");
+                        msg.extend_from_slice(&nonce);
+                        msg.extend_from_slice(&pid_bytes);
+                        if pk.verify(&msg, &sig) {
+                            ok = true;
+                        }
+                    }
+                }
+            }
+            if !ok {
+                warn!(%remote, peer = %claimed, "auth rejected");
+                return Err(SynapseError::Network("auth rejected".into()));
+            }
+            // allowlist check
+            if !allow_loopback {
+                if security.mode == "allowlist" {
+                    if !security.access.trusted_peers.iter().any(|p| p == &claimed.to_base58()) {
+                        warn!(%remote, peer = %claimed, "peer not allowlisted");
+                        return Err(SynapseError::Network("not allowlisted".into()));
+                    }
+                }
+            }
+            // bind
+            {
+                let mut s = auth_state.lock().await;
+                s.0 = true;
+                s.1 = Some(claimed);
+            }
+            let _ = send.finish();
+            Ok(())
+        }
         wire::CMD_GENERATE => {
+            // require auth unless loopback bypass
+            if !allow_loopback {
+                let authed = auth_state.lock().await.0;
+                if !authed {
+                    warn!(%remote, "generate before auth");
+                    return Err(SynapseError::Network("unauthenticated".into()));
+                }
+            }
             let (prompt, max_tokens) = wire::read_request_body(&mut recv).await.map_err(|err| {
                 SynapseError::Network(format!("failed to read the request: {err}"))
             })?;

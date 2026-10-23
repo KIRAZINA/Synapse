@@ -111,6 +111,16 @@ queue_capacity = 8
 # rejected with a "queue timeout" error event.
 queue_wait_ms = 5000
 
+[security]
+# "allowlist" (default) or "open" (dev only, logs a loud warning).
+mode = "allowlist"
+auth_timeout_ms = 5000
+nonce_ttl_ms = 30000
+allow_loopback = false
+
+[security.access]
+trusted_peers = []
+
 [bootstrap]
 # Multiaddrs of the peers that are dialed at start up.
 peers = []
@@ -216,25 +226,11 @@ impl Default for SecurityConfig {
 }
 
 /// Access control lists and per-peer quotas.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct SecurityAccessConfig {
     /// libp2p PeerId strings that are allowed to use this node.
     pub trusted_peers: Vec<String>,
-    /// Maximum concurrent generations per authenticated peer.
-    pub per_peer_concurrency: usize,
-    /// Rolling 60s budget of requested max_tokens per peer.
-    pub per_peer_tokens_per_minute: u64,
-}
-
-impl Default for SecurityAccessConfig {
-    fn default() -> Self {
-        Self {
-            trusted_peers: Vec::new(),
-            per_peer_concurrency: 1,
-            per_peer_tokens_per_minute: 4096,
-        }
-    }
 }
 
 impl Config {
