@@ -777,6 +777,29 @@ fn wait_on_wakeup<'a>(
     }
 }
 
+/// The static resource facts of an [`InferencePool`].
+///
+/// The KV-cache figure uses the same metadata formula that `llama.cpp` uses for
+/// `f16` K/V storage: `n_ctx * n_layer * n_head_kv * head_dim * 2 (K+V) * 2
+/// bytes`. It is an estimate for capacity planning, not a bit-exact measure of
+/// the allocator: the real resident set also contains the mapped weights and
+/// the compute buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolDiagnostics {
+    /// The number of live slots.
+    pub slots: usize,
+    /// The configured context window, in tokens.
+    pub context_length: u32,
+    /// The estimated KV-cache allocation of one slot, in bytes.
+    pub kv_bytes_per_slot: u64,
+    /// The estimated KV-cache allocation of every slot, in bytes.
+    pub kv_bytes_total: u64,
+    /// The size of the model file, in bytes.
+    pub model_bytes: u64,
+    /// The number of parameters reported by the model.
+    pub model_parameters: u64,
+}
+
 /// A fixed set of slots that share one model.
 ///
 /// The pool implements [`TokenStreamProvider`], so the networking layer is
@@ -800,6 +823,10 @@ pub struct InferencePool {
     /// The shared model. It is only used to tokenize prompts on the request
     /// path; the generation itself runs on the slot threads.
     model: Arc<LlamaModel>,
+    /// The context window every slot was created with.
+    context_length: u32,
+    /// The estimated KV-cache allocation of one slot, in bytes.
+    kv_bytes_per_slot: u64,
     /// Whether free slots are scored by their cached prefix.
     enable_affinity: bool,
     /// Whether every live slot has retired.
@@ -1003,11 +1030,31 @@ impl InferencePool {
             queue_capacity,
             queue_wait,
             model,
+            context_length,
+            kv_bytes_per_slot,
             enable_affinity,
             zero_capacity,
             slot_commands,
             handles,
         })
+    }
+
+    /// The static resource facts of this pool.
+    ///
+    /// These are the numbers an operator needs to size a host: the model size,
+    /// the configured context window, and the KV cache that every slot
+    /// allocates. The KV figure is the same estimate the pool logs at startup;
+    /// it is metadata arithmetic, not a measurement of the allocator.
+    pub fn diagnostics(&self) -> PoolDiagnostics {
+        let slots = self.capacity();
+        PoolDiagnostics {
+            slots,
+            context_length: self.context_length,
+            kv_bytes_per_slot: self.kv_bytes_per_slot,
+            kv_bytes_total: self.kv_bytes_per_slot.saturating_mul(slots as u64),
+            model_bytes: self.model.size_bytes(),
+            model_parameters: self.model.n_params(),
+        }
     }
 
     /// The number of live slots in the pool.

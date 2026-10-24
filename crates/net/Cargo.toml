@@ -22,3 +22,13 @@ bincode.workspace = true
 dashmap.workspace = true
 getrandom = "0.2"
 metrics.workspace = true
+
+[dev-dependencies]
+synapse-engine.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

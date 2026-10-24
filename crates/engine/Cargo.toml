@@ -16,3 +16,10 @@ metrics.workspace = true
 
 [dev-dependencies]
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

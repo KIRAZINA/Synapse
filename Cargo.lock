@@ -3631,6 +3631,7 @@ dependencies = [
  "synapse-core",
  "synapse-ffi",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3661,8 +3662,10 @@ dependencies = [
  "rustls",
  "serde",
  "synapse-core",
+ "synapse-engine",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

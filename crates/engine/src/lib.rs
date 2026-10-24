@@ -12,4 +12,4 @@
 
 pub mod pool;
 
-pub use pool::{AtCapacity, InferencePool, SlotGuard};
+pub use pool::{AtCapacity, InferencePool, PoolDiagnostics, SlotGuard};
