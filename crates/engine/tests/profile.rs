@@ -103,8 +103,10 @@ fn memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    let mut counters = PROCESS_MEMORY_COUNTERS::default();
-    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..PROCESS_MEMORY_COUNTERS::default()
+    };
 
     // SAFETY: the handle is the current process and the struct is fully
     // initialised with the size the API expects.
