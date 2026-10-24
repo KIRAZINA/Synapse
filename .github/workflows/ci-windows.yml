@@ -1,0 +1,43 @@
+name: CI (Windows)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test-windows:
+    name: build-and-test-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-gnu
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ hashFiles('**/Cargo.lock') }}
+      - name: Build, clippy, test (MinGW)
+        shell: msys2 {0}
+        run: |
+          cargo build --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace -- --test-threads=1
+      - name: MinGW PATH ordering hint
+        if: failure()
+        run: |
+          Write-Host "If the failure mentions STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139), a stale MinGW (e.g. C:\MinGW) is ahead of MSYS2 on PATH. Pin SYNAPSE_MINGW_BIN to the MSYS2 mingw64/bin that built the workspace."

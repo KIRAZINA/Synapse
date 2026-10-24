@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    name: build
+    runs-on: windows-latest
+    outputs:
+      hashes: ${{ steps.subjects.outputs.hashes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-gnu
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ hashFiles('**/Cargo.lock') }}
+      - name: Build release
+        shell: msys2 {0}
+        run: cargo build --release --workspace
+      - name: Package artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/synapse-node.exe dist/
+          Copy-Item target/release/synapse-cli.exe dist/
+          $zip = "synapse-${{ github.ref_name }}-windows-x86_64.zip"
+          Compress-Archive -Path dist/synapse-node.exe,dist/synapse-cli.exe -DestinationPath "dist/$zip"
+          (Get-FileHash "dist/$zip" -Algorithm SHA256).Hash + "  $zip" | Out-File -Encoding ascii dist/checksums.txt
+          (Get-FileHash dist/synapse-node.exe -Algorithm SHA256).Hash + "  synapse-node.exe" | Add-Content -Encoding ascii dist/checksums.txt
+          (Get-FileHash dist/synapse-cli.exe -Algorithm SHA256).Hash + "  synapse-cli.exe" | Add-Content -Encoding ascii dist/checksums.txt
+      - name: Generate SLSA subjects
+        id: subjects
+        shell: bash
+        run: |
+          cd dist
+          echo "hashes=$(sha256sum * | base64 -w0)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synapse-windows-x86_64
+          path: |
+            dist/*.zip
+            dist/checksums.txt
+
+  provenance:
+    name: provenance
+    needs: build
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2
+    with:
+      base64-subjects: ${{ needs.build.outputs.hashes }}
+
+  publish:
+    name: publish
+    needs: [build, provenance]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: synapse-windows-x86_64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*.intoto.jsonl'
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/checksums.txt
+            dist/*.intoto.jsonl
+          generate_release_notes: true

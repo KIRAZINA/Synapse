@@ -4,6 +4,7 @@
 *.bin
 .env
 .DS_Store
+/dist
 
 # Rust toolchain / build artifacts
 **/*.rs.bk
