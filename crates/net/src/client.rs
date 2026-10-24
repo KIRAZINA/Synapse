@@ -86,6 +86,29 @@ impl RemoteInferenceClient {
         prompt: String,
         max_tokens: u32,
     ) -> Result<(flume::Receiver<TokenEvent>, AbortHandle), SynapseError> {
+        self.generate_with_mode(prompt, max_tokens, false).await
+    }
+
+    /// Starts a **strict argmax** generation on the remote node.
+    ///
+    /// This is the only generation mode a verified request may use. The
+    /// command byte travels on the wire, so the server does not rely on an
+    /// out-of-band convention: it dispatches to
+    /// [`synapse_core::TokenStreamProvider::generate_streaming_greedy`].
+    pub async fn generate_greedy(
+        &self,
+        prompt: String,
+        max_tokens: u32,
+    ) -> Result<(flume::Receiver<TokenEvent>, AbortHandle), SynapseError> {
+        self.generate_with_mode(prompt, max_tokens, true).await
+    }
+
+    async fn generate_with_mode(
+        &self,
+        prompt: String,
+        max_tokens: u32,
+        greedy: bool,
+    ) -> Result<(flume::Receiver<TokenEvent>, AbortHandle), SynapseError> {
         let client_config = build_client_config(self.cert_der.clone())?;
 
         let connecting = self
@@ -130,10 +153,19 @@ impl RemoteInferenceClient {
             .await
             .map_err(|err| SynapseError::Network(format!("failed to open a quic stream: {err}")))?;
 
-        wire::write_request(&mut send, &prompt, max_tokens)
-            .await
-            .map_err(|err| SynapseError::Network(format!("failed to send the request: {err}")))?;
-
+        if greedy {
+            wire::write_greedy_request(&mut send, &prompt, max_tokens)
+                .await
+                .map_err(|err| {
+                    SynapseError::Network(format!("failed to send the request: {err}"))
+                })?;
+        } else {
+            wire::write_request(&mut send, &prompt, max_tokens)
+                .await
+                .map_err(|err| {
+                    SynapseError::Network(format!("failed to send the request: {err}"))
+                })?;
+        }
         let (event_sender, event_receiver) = flume::unbounded();
         let (abort_sender, mut abort_receiver) = oneshot::channel();
 

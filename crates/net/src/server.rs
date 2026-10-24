@@ -257,7 +257,12 @@ async fn handle_stream(
             let _ = send.finish();
             Ok(())
         }
-        wire::CMD_GENERATE => {
+        wire::CMD_GENERATE | wire::CMD_GENERATE_GREEDY => {
+            // A verified request asks for strict argmax with its command byte.
+            // The server honours it; it never silently samples on the
+            // verification path.
+            let greedy = command[0] == wire::CMD_GENERATE_GREEDY;
+
             // require auth unless loopback bypass
             if !allow_loopback {
                 let authed = auth_state.lock().await.0;
@@ -311,7 +316,7 @@ async fn handle_stream(
                 }
             }
 
-            let result = serve_generation(provider, send, recv, prompt, max_tokens, cancelled).await;
+            let result = serve_generation(provider, send, recv, prompt, max_tokens, cancelled, greedy).await;
 
             // decrement inflight
             if !allow_loopback {
@@ -360,8 +365,21 @@ async fn serve_generation(
     prompt: String,
     max_tokens: u32,
     mut cancelled: watch::Receiver<bool>,
+    greedy: bool,
 ) -> Result<(), SynapseError> {
-    let events = match provider.generate_streaming(prompt, max_tokens as usize) {
+    let generated = if greedy {
+        if provider.supports_greedy() {
+            provider.generate_streaming_greedy(prompt, max_tokens as usize)
+        } else {
+            Err(SynapseError::Engine(
+                "this node cannot decode greedily, so it cannot serve a verified request".to_owned(),
+            ))
+        }
+    } else {
+        provider.generate_streaming(prompt, max_tokens as usize)
+    };
+
+    let events = match generated {
         Ok(events) => events,
         Err(err) => {
             // A generation can be rejected before it starts. An at-capacity

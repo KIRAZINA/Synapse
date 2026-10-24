@@ -30,7 +30,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
-use synapse_core::{StopReason, SynapseError, TokenEvent};
+use synapse_core::{Sampling, StopReason, SynapseError, TokenEvent};
 use tracing::info;
 
 use crate::model::LlamaModel;
@@ -213,6 +213,31 @@ impl<'model> LlamaContext<'model> {
         max_tokens: usize,
         token_sender: Sender<TokenEvent>,
     ) -> Result<(), SynapseError> {
+        self.prefill_and_generate_with(
+            tokens,
+            prefill_from,
+            max_tokens,
+            token_sender,
+            Sampling::Seeded { seed: self.seed },
+        )
+    }
+
+    /// Runs a generation with an explicit sampling mode.
+    ///
+    /// [`Sampling::Greedy`] is strict argmax with no distribution sampler in
+    /// the chain at all. That is what redundant verification uses: a seeded
+    /// distribution sampler is reproducible only on the exact build that
+    /// produced it, so two honest nodes could disagree and one would be
+    /// punished for a difference that was not its fault. Argmax removes that
+    /// whole class of false accusation.
+    pub fn prefill_and_generate_with(
+        &mut self,
+        tokens: &[i32],
+        prefill_from: usize,
+        max_tokens: usize,
+        token_sender: Sender<TokenEvent>,
+        sampling: Sampling,
+    ) -> Result<(), SynapseError> {
         if max_tokens == 0 {
             return Err(self.fail(
                 &token_sender,
@@ -323,8 +348,14 @@ impl<'model> LlamaContext<'model> {
             "prompt prefill finished"
         );
 
-        let mut sampler =
-            LlamaSampler::chain_simple([LlamaSampler::dist(self.seed), LlamaSampler::greedy()]);
+        let mut sampler = match sampling {
+            // Strict argmax: no distribution sampler in the chain, so the
+            // output depends only on the logits and not on a PRNG state.
+            Sampling::Greedy => LlamaSampler::chain_simple([LlamaSampler::greedy()]),
+            Sampling::Seeded { seed } => {
+                LlamaSampler::chain_simple([LlamaSampler::dist(seed), LlamaSampler::greedy()])
+            }
+        };
 
         let started = Instant::now();
         let mut n_decoded = 0usize;

@@ -108,6 +108,33 @@ pub trait TokenStreamProvider: Send + Sync + 'static {
         max_tokens: usize,
     ) -> Result<flume::Receiver<TokenEvent>, SynapseError>;
 
+    /// Whether this provider can decode with strict argmax.
+    ///
+    /// Redundant verification requires it: a distribution sampler is only
+    /// reproducible on the exact build that produced it, so two honest nodes
+    /// would disagree and one would be punished for it. A provider that cannot
+    /// decode greedily is not eligible for verification, and the orchestrator
+    /// refuses to compare it rather than accusing it.
+    fn supports_greedy(&self) -> bool {
+        false
+    }
+
+    /// Starts a greedy (strict argmax) generation.
+    ///
+    /// The default implementation refuses. A provider that returns
+    /// [`supports_greedy`](Self::supports_greedy) `true` must override this, so
+    /// a provider can never claim greedy support and then silently sample.
+    fn generate_streaming_greedy(
+        &self,
+        _prompt: String,
+        _max_tokens: usize,
+    ) -> Result<flume::Receiver<TokenEvent>, SynapseError> {
+        Err(SynapseError::Engine(
+            "this provider cannot decode greedily, so it cannot take part in verification"
+                .to_owned(),
+        ))
+    }
+
     /// The number of generations that are currently running.
     fn active_requests(&self) -> u32;
 
@@ -130,6 +157,10 @@ pub trait TokenStreamProvider: Send + Sync + 'static {
 /// * **quantization** — `Q4_K_M` and `Q8_0` of the same model are different
 ///   functions; they diverge quickly on long generations.
 /// * **seed** — a seeded sampler is only reproducible when the seed matches.
+/// * **threads** — floating point addition is not associative, so a different
+///   thread count changes the reduction order and can flip a near-tie.
+/// * **backend** — a CPU and a GPU kernel accumulate in a different order for
+///   the same reason, and a different instruction set rounds differently.
 ///
 /// A request whose [`Determinism`] is not [`is_comparable`](Self::is_comparable)
 /// is therefore **refused** by the verifier instead of being compared: flagging
@@ -138,13 +169,14 @@ pub trait TokenStreamProvider: Send + Sync + 'static {
 ///
 /// # Residual risk (documented, not hidden)
 ///
-/// Even with temperature 0, an identical model, an identical quantization and
-/// an identical seed, two nodes can diverge: floating point addition is not
-/// associative, so a different thread count or a different CPU/GPU backend can
-/// change the reduction order and flip a near-tie in the logits. Verification
-/// detects *gross* misbehaviour (garbage output, a cheaper model, a truncated
-/// generation), which is what an authenticated-but-untrusted peer can actually
-/// get away with. It is not a bit-exact proof of the computation.
+/// Pinning threads and backend removes the *predictable* sources of numerical
+/// divergence. It does not remove all of them: two machines with the same
+/// thread count and the same backend can still differ if the underlying CPU
+/// supports different vector widths (AVX2 vs AVX-512), if the OS schedules
+/// differently, or if a different `llama.cpp` build was used. Verification
+/// therefore detects *gross* misbehaviour (garbage output, a cheaper model, a
+/// truncated generation), which is what an authenticated-but-untrusted peer can
+/// actually get away with. It is not a bit-exact proof of the computation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Determinism {
     /// The sampling temperature. Comparison requires exactly `0.0`.
@@ -155,27 +187,49 @@ pub struct Determinism {
     pub model: String,
     /// The quantization of the weights, for example `Q4_K_M`.
     pub quantization: String,
+    /// The number of threads the generation runs on.
+    ///
+    /// Part of the numerical identity: a different thread count changes the
+    /// order in which partial sums are reduced.
+    pub n_threads: u32,
+    /// The compute backend, for example `cpu`, `cuda` or `metal`.
+    ///
+    /// Part of the numerical identity for the same reason as `n_threads`.
+    pub backend: String,
 }
 
 impl Determinism {
-    /// Builds a deterministic (greedy) decoding configuration.
-    pub fn greedy(model: impl Into<String>, quantization: impl Into<String>, seed: u64) -> Self {
+    /// Builds a fully pinned, greedy decoding configuration.
+    ///
+    /// Every field is required: a comparison against an unspecified thread
+    /// count or backend is not a comparison, it is a guess.
+    pub fn greedy(
+        model: impl Into<String>,
+        quantization: impl Into<String>,
+        seed: u64,
+        n_threads: u32,
+        backend: impl Into<String>,
+    ) -> Self {
         Self {
             temperature: 0.0,
             seed,
             model: model.into(),
             quantization: quantization.into(),
+            n_threads,
+            backend: backend.into(),
         }
     }
 
     /// Whether outputs produced under this configuration may be compared.
     ///
-    /// All four properties have to be pinned: a comparison against an
-    /// unspecified model or quantization is not a comparison, it is a guess.
+    /// Every property has to be pinned: a comparison against an unspecified
+    /// model, quantization, thread count or backend is not a comparison.
     pub fn is_comparable(&self) -> bool {
         self.temperature == 0.0
             && !self.model.trim().is_empty()
             && !self.quantization.trim().is_empty()
+            && self.n_threads > 0
+            && !self.backend.trim().is_empty()
     }
 
     /// Whether two configurations are close enough to compare outputs.
@@ -190,6 +244,32 @@ impl Determinism {
             && self.seed == other.seed
             && self.model == other.model
             && self.quantization == other.quantization
+            && self.n_threads == other.n_threads
+            && self.backend == other.backend
+    }
+}
+
+/// How a generation picks its next token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sampling {
+    /// Strict argmax: the most likely token, every time.
+    ///
+    /// This is the only mode a verified request may use. A distribution
+    /// sampler, even with a fixed seed, is reproducible only on the exact
+    /// build that produced it; argmax is reproducible across builds that agree
+    /// on the logits.
+    Greedy,
+    /// A seeded distribution sampler, used by the normal (unverified) path.
+    Seeded {
+        /// The sampler seed.
+        seed: u32,
+    },
+}
+
+impl Sampling {
+    /// Whether this mode is strict argmax.
+    pub fn is_greedy(&self) -> bool {
+        matches!(self, Self::Greedy)
     }
 }
 

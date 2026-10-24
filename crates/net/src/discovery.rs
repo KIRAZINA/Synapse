@@ -80,6 +80,38 @@ pub fn strip_p2p(address: &Multiaddr) -> Multiaddr {
     stripped
 }
 
+/// Recovers a dialable control-plane address from a peer's telemetry.
+///
+/// The telemetry carries the addresses the node advertises, but not the
+/// `/p2p/<peer-id>` component that a dial needs. The first usable (non
+/// wildcard) address is reused and the peer id is appended, so the resulting
+/// multiaddr identifies the exact peer that was selected by the routing table.
+///
+/// # Errors
+///
+/// Returns an error when the peer advertised no usable address. A peer that
+/// cannot be reached must not be silently replaced by a different one.
+pub fn telemetry_multiaddr(telemetry: &NodeTelemetry) -> Result<Multiaddr, SynapseError> {
+    let address = telemetry
+        .addresses
+        .iter()
+        .filter_map(|address| address.parse::<Multiaddr>().ok())
+        .find(is_usable_address)
+        .ok_or_else(|| {
+            SynapseError::Network(format!(
+                "peer {} advertised no usable address",
+                telemetry.peer_id
+            ))
+        })?;
+
+    let mut dial = strip_p2p(&address);
+    if let Ok(peer) = telemetry.peer_id.parse::<PeerId>() {
+        dial.push(Protocol::P2p(peer));
+    }
+
+    Ok(dial)
+}
+
 /// Whether an address can be dialed from another host.
 ///
 /// A wildcard address (`0.0.0.0` / `::`) only tells a peer to listen on every

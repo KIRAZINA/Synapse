@@ -40,8 +40,13 @@ struct Cli {
     bootstrap: Option<String>,
 
     /// Multiaddr of a remote node that a prompt is forwarded to.
+    ///
+    /// Repeat the flag to name several nodes. A verified request needs
+    /// `verification.redundancy` *distinct* nodes; naming them explicitly is
+    /// the deterministic way to run it, and the mesh routing table is used to
+    /// fill any remaining slots.
     #[arg(long, value_name = "MULTIADDR")]
-    target: Option<String>,
+    target: Vec<String>,
 
     /// Prompt that is forwarded to the remote node.
     #[arg(long, value_name = "PROMPT")]
@@ -50,6 +55,31 @@ struct Cli {
     /// Number of tokens that are requested from the remote node.
     #[arg(long, default_value_t = 50, value_name = "COUNT")]
     max_tokens: u32,
+
+    /// Verify this request redundantly instead of trusting a single node.
+    ///
+    /// Requires `[verification].enabled = true`. The request is fanned out to
+    /// `redundancy` nodes running the same model, quantization, thread count
+    /// and backend, and the outputs are compared. This costs K times the
+    /// compute of a normal request, which is why it is opt-in per request and
+    /// off by default.
+    #[arg(long)]
+    verify: bool,
+
+    /// The quantization of the model, used to pin a verified request.
+    #[arg(long, default_value = "Q4_K_M", value_name = "QUANT")]
+    quantization: String,
+
+    /// The compute backend, used to pin a verified request.
+    #[arg(long, default_value = "cpu", value_name = "BACKEND")]
+    backend: String,
+
+    /// The number of threads, used to pin a verified request.
+    ///
+    /// Part of the numerical identity: a different thread count changes the
+    /// floating point reduction order, so two honest nodes could disagree.
+    #[arg(long, default_value_t = 4, value_name = "N")]
+    n_threads: u32,
 }
 
 /// The subcommands of the node.
@@ -134,6 +164,15 @@ async fn run() -> Result<()> {
         .await
         .map_err(|err| anyhow!("failed to start the network node: {err}"))?;
 
+    // The verified path shares the routing table with the running node. This
+    // is what makes the verdict matter: the same ledger the router reads is the
+    // one the verdict updates, so a peer caught disagreeing is deprioritized by
+    // the next routing decision instead of being punished in a private copy.
+    let verification = synapse_net::orchestrator::VerificationClient::new(
+        Arc::clone(network.routing()),
+        config.verification.clone(),
+    );
+
     let network_task = tokio::spawn(async move {
         if let Err(err) = network.run().await {
             error!("the network task stopped: {err}");
@@ -188,10 +227,52 @@ async fn run() -> Result<()> {
     }
 
     // Forward a prompt to a remote node when one was requested.
-    if let (Some(target), Some(prompt)) = (cli.target.as_deref(), cli.prompt.as_deref()) {
-        match forward_prompt(target, prompt, cli.max_tokens, shutdown_receiver).await {
-            Ok(()) => info!("the remote generation finished"),
-            Err(err) => error!("the remote generation failed: {err}"),
+    if let Some(prompt) = cli.prompt.as_deref() {
+        if cli.target.is_empty() {
+            warn!("a prompt was given without --target; nothing was forwarded");
+        } else {
+            // A verified request goes through the redundant-verification
+            // orchestrator instead of the single-node path. This is the
+            // production call site: `--verify` plus `[verification].enabled =
+            // true` is the only way to reach it, and the disabled path below is
+            // untouched.
+            if cli.verify {
+                match forward_prompt_verified(
+                    &verification,
+                    &cli.target,
+                    prompt,
+                    cli.max_tokens,
+                    &config.model.name,
+                    &cli.quantization,
+                    &cli.backend,
+                    cli.n_threads,
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        info!(
+                            requested = outcome.requested,
+                            answered = outcome.answered,
+                            accepted = outcome.is_accepted(),
+                            "the verified request finished"
+                        );
+                        match outcome.output() {
+                            Some(output) => println!("{output}"),
+                            None => warn!(
+                                non_responses = ?outcome.non_responses(),
+                                "the verified request did not reach a verdict"
+                            ),
+                        }
+                    }
+                    Err(err) => error!("the verified request failed: {err}"),
+                }
+            } else {
+                match forward_prompt(&cli.target[0], prompt, cli.max_tokens, shutdown_receiver).await
+                {
+                    Ok(()) => info!("the remote generation finished"),
+                    Err(err) => error!("the remote generation failed: {err}"),
+                }
+            }
         }
     }
 
@@ -377,6 +458,217 @@ fn start_metrics_exporter(port: u16) {
     match builder.install() {
         Ok(()) => info!(%address, "the prometheus exporter is serving /metrics"),
         Err(err) => error!("the prometheus exporter could not be started: {err}"),
+    }
+}
+
+/// Runs a request through redundant verification.
+///
+/// This is the production entry point of the compute-integrity layer. It is
+/// reached only when `--verify` is passed and `[verification].enabled = true`;
+/// otherwise the caller takes the normal single-node path unchanged.
+///
+/// The fan-out set is built from **distinct** nodes: the `--target` flags the
+/// operator named, then the routing table's best peers for the model. The same
+/// endpoint is never counted twice. It is then pinned to the model,
+/// quantization, thread count and backend the operator names, because a
+/// comparison across any of those is not a comparison: two honest nodes would
+/// disagree and one would be punished for a difference the configuration
+/// guaranteed.
+#[allow(clippy::too_many_arguments)]
+async fn forward_prompt_verified(
+    verification: &synapse_net::orchestrator::VerificationClient,
+    targets: &[String],
+    prompt: &str,
+    max_tokens: u32,
+    model: &str,
+    quantization: &str,
+    backend: &str,
+    n_threads: u32,
+) -> Result<synapse_net::orchestrator::VerificationOutcome> {
+    if !verification.policy().is_enabled() {
+        return Err(anyhow!(
+            "--verify needs [verification].enabled = true in the configuration: redundant \
+             verification costs {}x the compute of a normal request and is never forced on",
+            verification.redundancy()
+        ));
+    }
+
+    let determinism = synapse_net::orchestrator::pinned_determinism(
+        model,
+        quantization,
+        u64::from(synapse_net::orchestrator::VERIFICATION_SEED),
+        n_threads,
+        backend,
+    );
+
+    let redundancy = verification.redundancy();
+
+    // Candidate control-plane addresses, best first. Explicit targets win;
+    // the routing table fills the rest from peers that advertise this model
+    // and have free capacity.
+    let mut candidates: Vec<(String, PeerMultiaddr)> = Vec::with_capacity(redundancy);
+    for target in targets {
+        let address = parse_bootstrap(target)?;
+        let label = synapse_net::discovery::peer_id_from_multiaddr(&address)
+            .map(|peer| peer.to_base58())
+            .unwrap_or_else(|| address.to_string());
+        if !candidates.iter().any(|(existing, _)| existing == &label) {
+            candidates.push((label, address));
+        }
+    }
+    for telemetry in verification.fanout(model) {
+        if candidates.len() >= redundancy {
+            break;
+        }
+        if candidates
+            .iter()
+            .any(|(label, _)| label == &telemetry.peer_id)
+        {
+            continue;
+        }
+        let address = synapse_net::discovery::telemetry_multiaddr(&telemetry)?;
+        candidates.push((telemetry.peer_id, address));
+    }
+
+    // Fetch the QUIC endpoint of each candidate and keep only distinct
+    // endpoints. A repeated endpoint is one opinion asked twice, and counting
+    // it twice would both fake a quorum and reward one node K times.
+    let mut providers: Vec<(
+        String,
+        synapse_core::Determinism,
+        Arc<dyn TokenStreamProvider>,
+    )> = Vec::with_capacity(redundancy);
+    let mut endpoints: Vec<SocketAddr> = Vec::with_capacity(redundancy);
+
+    for (peer, target) in candidates {
+        if providers.len() >= redundancy {
+            break;
+        }
+
+        let (addr, cert_der, nonce, _expiry) = fetch_quic_info(&target).await?;
+        if endpoints.contains(&addr) {
+            warn!(%peer, %addr, "ignoring a duplicate verification endpoint");
+            continue;
+        }
+
+        let keypair = synapse_net::generate_keypair();
+        let client = RemoteInferenceClient::new(addr, cert_der, keypair, nonce)?;
+        endpoints.push(addr);
+        providers.push((peer, determinism.clone(), Arc::new(RemoteProvider { client })));
+    }
+
+    if providers.len() < redundancy {
+        return Err(anyhow!(
+            "verification is pinned to {} distinct peers, but only {} could be reached: a \
+             repeated endpoint is not redundancy",
+            redundancy,
+            providers.len()
+        ));
+    }
+
+    let outcome = verification
+        .verify(prompt, max_tokens, determinism, providers)
+        .await
+        .map_err(|err| anyhow!("the verified request failed: {err}"))?;
+
+    // The verdict was applied to the routing table's ledger. Publish it so the
+    // score of every participant is observable per node.
+    let ledger = verification.routing().reputation_ledger();
+    for (peer, entry) in ledger.snapshot() {
+        info!(%peer, score = entry.score, observations = entry.observations, "peer reputation");
+    }
+    synapse_net::verify::publish_reputation(ledger);
+
+    Ok(outcome)
+}
+
+/// A [`TokenStreamProvider`] backed by a remote QUIC node.
+///
+/// This is what makes the verified path end-to-end: the orchestrator fans out
+/// to real peers over the data plane, not to an in-process stub.
+struct RemoteProvider {
+    client: RemoteInferenceClient,
+}
+
+impl TokenStreamProvider for RemoteProvider {
+    fn generate_streaming(
+        &self,
+        prompt: String,
+        max_tokens: usize,
+    ) -> std::result::Result<flume::Receiver<TokenEvent>, synapse_core::SynapseError> {
+        let max_tokens = u32::try_from(max_tokens).unwrap_or(u32::MAX);
+        let client = self.client.clone();
+        let (sender, receiver) = flume::unbounded();
+
+        tokio::spawn(async move {
+            match client.generate(prompt, max_tokens).await {
+                Ok((events, _abort)) => {
+                    while let Ok(event) = events.recv_async().await {
+                        let terminal =
+                            matches!(event, TokenEvent::Done { .. } | TokenEvent::Error { .. });
+                        if sender.send(event).is_err() || terminal {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = sender.send(TokenEvent::Error {
+                        message: err.to_string(),
+                    });
+                }
+            }
+        });
+
+        Ok(receiver)
+    }
+
+    /// A remote node is asked for a **strict argmax** generation.
+    ///
+    /// The greedy command byte travels on the wire, so the remote node
+    /// dispatches to its own greedy path rather than sampling with its
+    /// configured seed. Without this, two honest nodes configured with
+    /// different samplers would diverge and one would be punished for it.
+    fn supports_greedy(&self) -> bool {
+        true
+    }
+
+    fn generate_streaming_greedy(
+        &self,
+        prompt: String,
+        max_tokens: usize,
+    ) -> std::result::Result<flume::Receiver<TokenEvent>, synapse_core::SynapseError> {
+        let max_tokens = u32::try_from(max_tokens).unwrap_or(u32::MAX);
+        let client = self.client.clone();
+        let (sender, receiver) = flume::unbounded();
+
+        tokio::spawn(async move {
+            match client.generate_greedy(prompt, max_tokens).await {
+                Ok((events, _abort)) => {
+                    while let Ok(event) = events.recv_async().await {
+                        let terminal =
+                            matches!(event, TokenEvent::Done { .. } | TokenEvent::Error { .. });
+                        if sender.send(event).is_err() || terminal {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = sender.send(TokenEvent::Error {
+                        message: err.to_string(),
+                    });
+                }
+            }
+        });
+
+        Ok(receiver)
+    }
+
+    fn active_requests(&self) -> u32 {
+        0
+    }
+
+    fn max_capacity(&self) -> u32 {
+        1
     }
 }
 

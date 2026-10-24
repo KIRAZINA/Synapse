@@ -10,6 +10,11 @@
 //! CMD_GENERATE | max_tokens: u32 | prompt_len: u32 | prompt: [u8]
 //! ```
 //!
+//! `CMD_GENERATE_GREEDY` has the same body and asks the server for strict
+//! argmax instead of its configured sampler. A verified request must use it:
+//! a distribution sampler is not reproducible across honest nodes, so
+//! comparing sampled outputs would accuse an honest node.
+//!
 //! # Events (server to client)
 //!
 //! ```text
@@ -25,6 +30,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Command: generate tokens for a prompt.
 pub const CMD_GENERATE: u8 = 0x01;
+
+/// Command: generate tokens with strict argmax.
+///
+/// Same request body as [`CMD_GENERATE`]. The command byte is what makes the
+/// verification path greedy end to end: the client asks for it and the server
+/// dispatches to [`synapse_core::TokenStreamProvider::generate_streaming_greedy`]
+/// rather than silently sampling on the verified path.
+pub const CMD_GENERATE_GREEDY: u8 = 0x04;
 
 /// Command: the data plane smoke test.
 pub const CMD_PING: u8 = 0x02;
@@ -55,6 +68,31 @@ pub async fn write_request<W>(writer: &mut W, prompt: &str, max_tokens: u32) -> 
 where
     W: AsyncWrite + Unpin,
 {
+    write_request_with_command(writer, CMD_GENERATE, prompt, max_tokens).await
+}
+
+/// Writes a generation request that asks for strict argmax.
+pub async fn write_greedy_request<W>(
+    writer: &mut W,
+    prompt: &str,
+    max_tokens: u32,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_request_with_command(writer, CMD_GENERATE_GREEDY, prompt, max_tokens).await
+}
+
+/// Writes a generation request with an explicit command byte.
+async fn write_request_with_command<W>(
+    writer: &mut W,
+    command: u8,
+    prompt: &str,
+    max_tokens: u32,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let prompt_bytes = prompt.as_bytes();
     if prompt_bytes.len() > MAX_PROMPT_BYTES {
         return Err(io::Error::new(
@@ -64,7 +102,7 @@ where
     }
 
     let mut frame = Vec::with_capacity(1 + 4 + 4 + prompt_bytes.len());
-    frame.push(CMD_GENERATE);
+    frame.push(command);
     frame.extend_from_slice(&max_tokens.to_be_bytes());
     frame.extend_from_slice(&(prompt_bytes.len() as u32).to_be_bytes());
     frame.extend_from_slice(prompt_bytes);
@@ -314,4 +352,36 @@ where
     let mut sig = vec![0u8; sig_len];
     reader.read_exact(&mut sig).await?;
     Ok((pid, pk, nonce, sig))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_greedy_command_is_distinct_on_the_wire() {
+        let mut greedy = Vec::new();
+        write_greedy_request(&mut greedy, "hello", 7)
+            .await
+            .expect("the frame is writable");
+        assert_eq!(greedy[0], CMD_GENERATE_GREEDY);
+        assert_ne!(
+            greedy[0], CMD_GENERATE,
+            "a verified request must not fall back to the sampled command"
+        );
+
+        let mut body = greedy.as_slice();
+        body = &body[1..];
+        let (prompt, max_tokens) = read_request_body(&mut body)
+            .await
+            .expect("the greedy body has the same shape");
+        assert_eq!(prompt, "hello");
+        assert_eq!(max_tokens, 7);
+
+        let mut sampled = Vec::new();
+        write_request(&mut sampled, "hello", 7)
+            .await
+            .expect("the frame is writable");
+        assert_eq!(sampled[0], CMD_GENERATE);
+    }
 }

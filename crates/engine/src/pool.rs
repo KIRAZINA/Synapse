@@ -67,7 +67,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flume::{Receiver, Sender};
-use synapse_core::{SynapseError, TokenEvent, TokenStreamProvider};
+use synapse_core::{Sampling, SynapseError, TokenEvent, TokenStreamProvider};
 use synapse_ffi::model::LlamaModel;
 use synapse_ffi::{LlamaBackend, LlamaContext, LlamaContextParams};
 use tracing::{error, info, warn};
@@ -92,6 +92,13 @@ pub static FORCE_RETIRE_AFTER_GENERATION: AtomicBool = AtomicBool::new(false);
 
 /// Fallback number of threads when the parallelism of the host is unknown.
 const DEFAULT_THREADS: usize = 4;
+
+/// The sampler seed of the normal (unverified) generation path.
+///
+/// Kept equal to the FFI default so the unverified path is bit-for-bit what it
+/// was before verification existed. A verified request does not use this seed:
+/// it decodes with strict argmax, where the seed plays no part.
+const DEFAULT_SEED: u32 = 1234;
 
 /// One mebibyte, used for the KV cache log lines.
 const MIB: u64 = 1024 * 1024;
@@ -141,6 +148,8 @@ struct QueuedRequest {
     tokens: Vec<i32>,
     /// Maximum number of tokens to generate.
     max_tokens: usize,
+    /// How the next token is picked.
+    sampling: Sampling,
     /// Channel the generation eventually streams on.
     token_sender: Sender<TokenEvent>,
     /// When the request entered the queue, used for the wait histogram.
@@ -448,6 +457,8 @@ enum SlotCommand {
         prefill_from: usize,
         /// Maximum number of tokens to generate.
         max_tokens: usize,
+        /// How the next token is picked. Verification requires `Greedy`.
+        sampling: Sampling,
         /// Channel the generated events are sent on.
         token_sender: Sender<TokenEvent>,
         /// The slot that serves this request. The guard is moved into the
@@ -468,6 +479,7 @@ fn dispatch_command(
     tokens: Vec<i32>,
     prefill_from: usize,
     max_tokens: usize,
+    sampling: Sampling,
     token_sender: Sender<TokenEvent>,
 ) -> Result<(), SynapseError> {
     let command_sender = guard.commands().clone();
@@ -475,6 +487,7 @@ fn dispatch_command(
         tokens,
         prefill_from,
         max_tokens,
+        sampling,
         token_sender,
         guard,
     };
@@ -655,6 +668,7 @@ fn admission_loop(
         let depth = registry.queue.len();
         let tokens = request.tokens;
         let max_tokens = request.max_tokens;
+        let sampling = request.sampling;
         let token_sender = request.token_sender;
 
         // The registry lock is released before the command is sent and before
@@ -670,7 +684,7 @@ fn admission_loop(
             metrics::counter!("synapse_slot_affinity_matches_total").increment(1);
         }
 
-        if let Err(err) = dispatch_command(guard, tokens, prefill_from, max_tokens, token_sender) {
+        if let Err(err) = dispatch_command(guard, tokens, prefill_from, max_tokens, sampling, token_sender) {
             warn!(%err, "a queued request could not be dispatched");
         }
 
@@ -1118,6 +1132,7 @@ impl InferencePool {
         &self,
         prompt: String,
         max_tokens: usize,
+        sampling: Sampling,
     ) -> Result<Receiver<TokenEvent>, SynapseError> {
         let tokens = self.model.tokenize_prompt(&prompt)?;
         let (token_sender, token_receiver) = flume::unbounded::<TokenEvent>();
@@ -1127,12 +1142,12 @@ impl InferencePool {
             let (guard, prefill_from) = self
                 .acquire_affine(&tokens)
                 .map_err(|err| SynapseError::Engine(err.to_string()))?;
-            dispatch_command(guard, tokens, prefill_from, max_tokens, token_sender)?;
+            dispatch_command(guard, tokens, prefill_from, max_tokens, sampling, token_sender)?;
         } else {
             // Capture the monotonic admission instant before any lock or enqueue
             // attempt, so the deadline is not shortened by lock contention.
             let queued_at = Instant::now();
-            self.acquire_or_enqueue(tokens, max_tokens, token_sender, queued_at)?;
+            self.acquire_or_enqueue(tokens, max_tokens, sampling, token_sender, queued_at)?;
         }
 
         Ok(token_receiver)
@@ -1148,6 +1163,7 @@ impl InferencePool {
         &self,
         tokens: Vec<i32>,
         max_tokens: usize,
+        sampling: Sampling,
         token_sender: Sender<TokenEvent>,
         queued_at: Instant,
     ) -> Result<(), SynapseError> {
@@ -1177,7 +1193,7 @@ impl InferencePool {
                     metrics::counter!("synapse_slot_affinity_matches_total").increment(1);
                 }
 
-                return dispatch_command(guard, tokens, reusable, max_tokens, token_sender);
+                return dispatch_command(guard, tokens, reusable, max_tokens, sampling, token_sender);
             }
         }
 
@@ -1204,6 +1220,7 @@ impl InferencePool {
         registry.queue.push_back(QueuedRequest {
             tokens,
             max_tokens,
+            sampling,
             token_sender,
             queued_at,
             deadline,
@@ -1262,7 +1279,21 @@ impl TokenStreamProvider for InferencePool {
         prompt: String,
         max_tokens: usize,
     ) -> Result<Receiver<TokenEvent>, SynapseError> {
-        self.start_generation(prompt, max_tokens)
+        self.start_generation(prompt, max_tokens, Sampling::Seeded { seed: DEFAULT_SEED })
+    }
+
+    /// The pool can decode with strict argmax, which is what verification
+    /// requires.
+    fn supports_greedy(&self) -> bool {
+        true
+    }
+
+    fn generate_streaming_greedy(
+        &self,
+        prompt: String,
+        max_tokens: usize,
+    ) -> Result<Receiver<TokenEvent>, SynapseError> {
+        self.start_generation(prompt, max_tokens, Sampling::Greedy)
     }
 
     fn active_requests(&self) -> u32 {
@@ -1358,6 +1389,7 @@ impl SlotStartup {
                     tokens,
                     prefill_from,
                     max_tokens,
+                    sampling,
                     token_sender,
                     guard,
                 } => {
@@ -1371,6 +1403,7 @@ impl SlotStartup {
                             &tokens,
                             prefill_from,
                             max_tokens,
+                            sampling,
                             token_sender,
                             SlotCache {
                                 enabled: enable_prefix_caching,
@@ -1464,6 +1497,7 @@ fn run_generation(
     tokens: &[i32],
     prefill_from: usize,
     max_tokens: usize,
+    sampling: Sampling,
     token_sender: Sender<TokenEvent>,
     cache: SlotCache<'_>,
 ) -> Result<(), SynapseError> {
@@ -1510,7 +1544,7 @@ fn run_generation(
         context.clear_cache();
     }
 
-    context.prefill_and_generate(tokens, prefill_from, max_tokens, token_sender)?;
+    context.prefill_and_generate_with(tokens, prefill_from, max_tokens, token_sender, sampling)?;
 
     // Test hook. It fires after the completion tokens were decoded and before
     // the slot is trimmed, which is exactly the state a panic in the middle of

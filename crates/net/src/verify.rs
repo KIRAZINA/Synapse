@@ -184,6 +184,26 @@ impl VerificationRequest {
             });
         }
 
+        // Threads and backend are part of the numerical identity: floating
+        // point addition is not associative, so a different thread count or a
+        // different kernel changes the reduction order and can flip a near-tie.
+        // An unpinned request is refused rather than compared, because
+        // comparing it would punish an honest node for a difference the
+        // configuration never ruled out.
+        if determinism.n_threads == 0 {
+            return Err(VerificationError::NotDeterministic {
+                reason: "the thread count is unspecified, so the outputs are not comparable"
+                    .to_owned(),
+            });
+        }
+
+        if determinism.backend.trim().is_empty() {
+            return Err(VerificationError::NotDeterministic {
+                reason: "the compute backend is unspecified, so the outputs are not comparable"
+                    .to_owned(),
+            });
+        }
+
         Ok(Self {
             prompt: prompt.into(),
             determinism,
@@ -402,7 +422,7 @@ mod tests {
     use super::*;
 
     fn deterministic() -> Determinism {
-        Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234)
+        Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 4, "cpu")
     }
 
     fn request() -> VerificationRequest {
@@ -426,11 +446,67 @@ mod tests {
 
     #[test]
     fn an_unspecified_quantization_is_refused() {
-        let determinism = Determinism::greedy("tinyllama-1.1b", "", 1234);
+        let determinism = Determinism::greedy("tinyllama-1.1b", "", 1234, 4, "cpu");
         let result = VerificationRequest::new("hello", determinism, 16);
         assert!(matches!(
             result,
             Err(VerificationError::NotDeterministic { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unspecified_thread_count_is_refused() {
+        let determinism = Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 0, "cpu");
+        let result = VerificationRequest::new("hello", determinism, 16);
+        assert!(
+            matches!(result, Err(VerificationError::NotDeterministic { .. })),
+            "a request without a pinned thread count is not comparable"
+        );
+    }
+
+    #[test]
+    fn an_unspecified_backend_is_refused() {
+        let determinism = Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 4, "");
+        let result = VerificationRequest::new("hello", determinism, 16);
+        assert!(
+            matches!(result, Err(VerificationError::NotDeterministic { .. })),
+            "a request without a pinned backend is not comparable"
+        );
+    }
+
+    #[test]
+    fn a_different_thread_count_is_not_comparable() {
+        let participants = vec![
+            ("a".to_owned(), deterministic(), "same".to_owned()),
+            (
+                "b".to_owned(),
+                Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 8, "cpu"),
+                "same".to_owned(),
+            ),
+        ];
+
+        let result = verify(&request(), &participants);
+        assert!(matches!(
+            result,
+            Err(VerificationError::IncompatibleParticipants { .. })
+        ));
+    }
+
+    #[test]
+    fn a_different_backend_is_not_comparable() {
+        let participants = vec![
+            ("a".to_owned(), deterministic(), "same".to_owned()),
+            (
+                "b".to_owned(),
+                Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 4, "cuda"),
+                "same".to_owned(),
+            ),
+        ];
+
+        let result = verify(&request(), &participants);
+        assert!(matches!(
+            result,
+            Err(VerificationError::IncompatibleParticipants { .. })
         ));
     }
 
@@ -492,7 +568,7 @@ mod tests {
             ("a".to_owned(), deterministic(), "same".to_owned()),
             (
                 "b".to_owned(),
-                Determinism::greedy("tinyllama-1.1b", "Q8_0", 1234),
+                Determinism::greedy("tinyllama-1.1b", "Q8_0", 1234, 4, "cpu"),
                 "same".to_owned(),
             ),
         ];
@@ -510,7 +586,7 @@ mod tests {
             ("a".to_owned(), deterministic(), "same".to_owned()),
             (
                 "b".to_owned(),
-                Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 99),
+                Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 99, 4, "cpu"),
                 "same".to_owned(),
             ),
         ];

@@ -12,5 +12,6 @@ pub use config::{
     SecurityConfig, VerificationConfig, DEFAULT_CONFIG_FILE,
 };
 pub use types::{
-    Determinism, NodeTelemetry, Prompt, StopReason, SynapseError, TokenEvent, TokenStreamProvider,
+    Determinism, NodeTelemetry, Prompt, Sampling, StopReason, SynapseError, TokenEvent,
+    TokenStreamProvider,
 };

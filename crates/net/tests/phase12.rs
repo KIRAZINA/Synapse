@@ -35,7 +35,7 @@ fn telemetry(peer: &PeerId, active: u32, cap: u32) -> NodeTelemetry {
 }
 
 fn deterministic() -> Determinism {
-    Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234)
+    Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 4, "cpu")
 }
 
 fn request() -> VerificationRequest {
@@ -324,13 +324,13 @@ fn verification_requires_determinism() {
     );
 
     // An unspecified model or quantization is not comparable either.
-    let no_model = Determinism::greedy("", "Q4_K_M", 1234);
+    let no_model = Determinism::greedy("", "Q4_K_M", 1234, 4, "cpu");
     assert!(matches!(
         VerificationRequest::new("prompt", no_model, 16),
         Err(VerificationError::NotDeterministic { .. })
     ));
 
-    let no_quant = Determinism::greedy("tinyllama-1.1b", "", 1234);
+    let no_quant = Determinism::greedy("tinyllama-1.1b", "", 1234, 4, "cpu");
     assert!(matches!(
         VerificationRequest::new("prompt", no_quant, 16),
         Err(VerificationError::NotDeterministic { .. })
@@ -342,7 +342,7 @@ fn verification_requires_determinism() {
         ("node-a".to_owned(), deterministic(), "same".to_owned()),
         (
             "node-b".to_owned(),
-            Determinism::greedy("tinyllama-1.1b", "Q8_0", 1234),
+            Determinism::greedy("tinyllama-1.1b", "Q8_0", 1234, 4, "cpu"),
             "same".to_owned(),
         ),
     ];
@@ -359,7 +359,7 @@ fn verification_requires_determinism() {
         ("node-a".to_owned(), deterministic(), "same".to_owned()),
         (
             "node-b".to_owned(),
-            Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 7),
+            Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 7, 4, "cpu"),
             "same".to_owned(),
         ),
     ];
@@ -373,7 +373,7 @@ fn verification_requires_determinism() {
         ("node-a".to_owned(), deterministic(), "same".to_owned()),
         (
             "node-b".to_owned(),
-            Determinism::greedy("llama-3-8b", "Q4_K_M", 1234),
+            Determinism::greedy("llama-3-8b", "Q4_K_M", 1234, 4, "cpu"),
             "same".to_owned(),
         ),
     ];
@@ -382,8 +382,58 @@ fn verification_requires_determinism() {
         Err(VerificationError::IncompatibleParticipants { .. })
     ));
 
+    // Threads and backend are part of the numerical identity, so an
+    // under-specified request is refused before any compute is spent. This is
+    // a negative test: it must fail if the fields are silently ignored.
+    let no_threads = Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 0, "cpu");
+    assert!(
+        matches!(
+            VerificationRequest::new("prompt", no_threads, 16),
+            Err(VerificationError::NotDeterministic { .. })
+        ),
+        "an unspecified thread count must be refused"
+    );
+
+    let no_backend = Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 4, "");
+    assert!(
+        matches!(
+            VerificationRequest::new("prompt", no_backend, 16),
+            Err(VerificationError::NotDeterministic { .. })
+        ),
+        "an unspecified backend must be refused"
+    );
+
+    // A participant whose thread count differs is not comparable, even when
+    // its output happens to match: comparing it would punish an honest node
+    // for a difference the configuration guaranteed.
+    let different_threads = vec![
+        ("node-a".to_owned(), deterministic(), "same".to_owned()),
+        (
+            "node-b".to_owned(),
+            Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 8, "cpu"),
+            "same".to_owned(),
+        ),
+    ];
+    assert!(matches!(
+        verify(&request(), &different_threads),
+        Err(VerificationError::IncompatibleParticipants { .. })
+    ));
+
+    let different_backend = vec![
+        ("node-a".to_owned(), deterministic(), "same".to_owned()),
+        (
+            "node-b".to_owned(),
+            Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 4, "cuda"),
+            "same".to_owned(),
+        ),
+    ];
+    assert!(matches!(
+        verify(&request(), &different_backend),
+        Err(VerificationError::IncompatibleParticipants { .. })
+    ));
+
     // The happy path still works: greedy, same model, same quantization, same
-    // seed is comparable.
+    // seed, same threads and same backend is comparable.
     assert!(deterministic().is_comparable());
     assert!(deterministic().is_compatible_with(&deterministic()));
 

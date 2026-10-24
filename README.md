@@ -18,6 +18,50 @@ has the requested model.
 
 ## Build and run
 
+### Windows: pin one MinGW toolchain
+
+The workspace builds for `x86_64-pc-windows-gnu`, and the test binaries link
+against the MinGW runtime DLLs. If two MinGW installations are on `PATH`, the
+wrong `libstdc++-6.dll` / `libgcc_s_seh-1.dll` gets picked up and every test
+binary that touches `llama.cpp` dies at startup with:
+
+```
+process didn't exit successfully: ... (exit code: 0xc0000139, STATUS_ENTRYPOINT_NOT_FOUND)
+```
+
+That is a complete test-suite failure, not a cosmetic warning: the engine, ffi
+and node tiers simply do not run. Pin the MSYS2 toolchain **before** any other
+MinGW on `PATH`, in the shell that runs the tests:
+
+```powershell
+$env:PATH = "$env:USERPROFILE\msys64\mingw64\bin;" + $env:PATH
+```
+
+Use the same installation that built the workspace. A second MSYS2 (for
+example `C:\msys64`, gcc 15.2) is a **different** toolchain: its DLLs and the
+objects already in `target/` do not match, so pinning the wrong one reproduces
+the same crash. Verify which toolchain is actually first, and that it is the
+one that built the workspace:
+
+```powershell
+where.exe gcc          # the first entry must be the selected MSYS2 one
+gcc --version          # must equal the version that built target/
+```
+
+A stale `C:\MinGW\mingw64\bin` (gcc 8.1.0) earlier on `PATH` is the usual
+cause. Either remove it from the system `PATH` or put the MSYS2 directory ahead
+of it permanently. `scripts/test.ps1` does this for every test invocation: it
+puts the selected MSYS2 toolchain first and removes the stale entry, so the
+engine, ffi and node binaries never load a mismatched `libstdc++-6.dll` or
+`libgcc_s_seh-1.dll`. Select an install explicitly with `SYNAPSE_MINGW_BIN`;
+otherwise the script prefers `%USERPROFILE%\msys64\mingw64\bin`.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test.ps1
+```
+
+### Build
+
 A GGUF model is required. The default configuration expects
 `models/TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf`:
 
@@ -25,6 +69,21 @@ A GGUF model is required. The default configuration expects
 cargo build --release
 cargo run --release -p synapse-node -- init-config
 cargo run --release -p synapse-node -- --config synapse.toml
+```
+
+### Test tiers
+
+The fast tier is the default and needs no model:
+
+```sh
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test.ps1
+```
+
+The model-backed tier is `#[ignore]`d because it loads a real GGUF and takes
+minutes. It is not optional for a release: run it explicitly.
+
+```sh
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\test.ps1 -p synapse-engine --test pool -- --ignored --test-threads=1
 ```
 
 In another terminal:
@@ -289,6 +348,51 @@ are compared exactly:
 - **no strict majority** (a tie, or three different answers) flags the request
   and moves *no* reputation, because there is no evidence about who was wrong.
 
+#### A non-response is not a vote
+
+Every requested participant has to answer. With `K = 3`, one timeout does not
+mean "two matched, so it is fine": it means the request did not reach quorum,
+so it is flagged and no reputation moves.
+
+The stricter rule is deliberate. A silent node is indistinguishable from a node
+that is down, a node that is overloaded, and a node that is deliberately evading
+a check it would fail. Treating silence as an abstention that lets the others
+carry the request hands a lazy node exactly the incentive it wants: answer
+nothing, cost nothing, and let the honest nodes absorb the compute. Requiring
+full participation makes silence cost the request.
+
+The price is availability: one dead node blocks verification of that request.
+That is acceptable because verification is a spot check on a sampled fraction of
+traffic, not the request path itself; the caller still has the normal
+single-node answer.
+
+#### Where it runs
+
+`synapse_net::orchestrator::VerificationClient::verify` is the production entry
+point. `bin/node/src/main.rs` builds it from the running node's
+`Arc<RoutingTable>` and calls it when `--verify` is passed and
+`[verification].enabled = true`. The fan-out is built from the `--target` flags
+first and then from the routing table's best peers for the model; **the same
+endpoint is never counted twice**. Every participant is a real QUIC client, and
+the verdict is applied to the routing table's own ledger, so `best_peers` sees
+the new score on the next request. When verification is disabled the
+orchestrator is never entered and the request takes the normal single-node path
+unchanged.
+
+```sh
+# Three distinct nodes, one verified request (K = redundancy = 3):
+synapse-node --verify --prompt "what is 2 + 2?" --max-tokens 32 \
+  --target /ip4/127.0.0.1/tcp/4101/p2p/12D3... \
+  --target /ip4/127.0.0.1/tcp/4102/p2p/12D3... \
+  --target /ip4/127.0.0.1/tcp/4103/p2p/12D3...
+```
+
+The verified path asks the peers for `CMD_GENERATE_GREEDY`, a distinct wire
+command: the server dispatches to `generate_streaming_greedy`, so the remote
+node runs strict argmax instead of its configured sampler. A node that cannot
+decode greedily is a failed vote, not a liar, and is excluded rather than
+penalized.
+
 ### Cost: this is K times the compute
 
 Verification is **off by default** (`enabled = false`) and is never forced on
@@ -304,24 +408,35 @@ That is the whole tradeoff: you are buying a spot check, not a proof.
 ### The determinism constraint
 
 Comparison is only valid when the participants were *supposed* to produce the
-same output. That requires the **same model**, the **same quantization**, and
-**greedy decoding (temperature 0)** with the **same seed**. A request that
-cannot be pinned to a deterministic configuration is refused rather than
-compared, and a participant reporting a different model, quantization or seed is
-excluded from the comparison. Flagging an honest node for a difference the
-configuration guaranteed is worse than not verifying at all.
+same output. The pinned configuration is the **same model**, the **same
+quantization**, **greedy decoding (temperature 0)**, the **same seed**, the
+**same thread count** and the **same backend**. A request that cannot be pinned
+is refused rather than compared, and a participant reporting a different value
+for any of those fields is excluded from the comparison. Flagging an honest node
+for a difference the configuration guaranteed is worse than not verifying at
+all.
+
+Threads and the backend are part of the numerical identity, not metadata:
+floating point addition is not associative, so a different reduction order can
+flip a near-tie in the logits. A request that does not pin them is refused by
+`VerificationRequest::new`, and `verify` refuses a participant whose thread
+count or backend differs. The verification path also uses strict argmax on the
+wire (`CMD_GENERATE_GREEDY`); there is no distributed sampler.
 
 This is enforced in code, not in a comment: `VerificationRequest::new` rejects
-temperature above zero and an unspecified model or quantization, and
-`verify` rejects incompatible participants.
+temperature above zero and an unspecified model, quantization, thread count or
+backend, and `verify` rejects incompatible participants.
 
-**Residual risk, stated plainly.** Even with everything pinned, two nodes can
-diverge: floating point addition is not associative, so a different thread count
-or a different CPU/GPU backend can change the reduction order and flip a near-tie
-in the logits. Verification catches gross misbehaviour — garbage output, a
-cheaper model, a truncated generation — which is what an authenticated but
-untrusted peer can actually get away with. It is not a bit-exact proof of the
-computation, and there is no zkML here.
+**Residual risk, stated plainly.** Pinning removes the *predictable* sources of
+divergence, not all of them. Two machines with the same thread count and
+backend can still differ if their CPUs support different vector widths (AVX2
+vs AVX-512), if the `llama.cpp` build differs, or if the operating system
+schedules differently. Verification therefore catches gross misbehaviour —
+garbage output, a cheaper model, a truncated generation — which is what an
+authenticated but untrusted peer can actually get away with. It is not a
+bit-exact proof of the computation, and there is no zkML here. When the pinned
+configuration differs, the request is rejected rather than an innocent node
+being accused.
 
 ### Metrics
 

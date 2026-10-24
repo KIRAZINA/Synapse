@@ -14,6 +14,7 @@
 
 pub mod client;
 pub mod discovery;
+pub mod orchestrator;
 pub mod reputation;
 pub mod routing;
 pub mod server;
@@ -32,7 +33,9 @@ use futures_util::StreamExt;
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
-use synapse_core::{NodeTelemetry, SecurityConfig, SynapseError, TokenStreamProvider, VerificationConfig};
+use synapse_core::{
+    NodeTelemetry, SecurityConfig, SynapseError, TokenStreamProvider, VerificationConfig,
+};
 use tracing::{debug, info, warn};
 
 use crate::discovery::{
