@@ -16,7 +16,7 @@ use synapse_core::{Determinism, NodeTelemetry, VerificationConfig};
 use synapse_net::reputation::ReputationLedger;
 use synapse_net::routing::RoutingTable;
 use synapse_net::verify::{
-    apply_verdict, verify, VerificationError, VerificationPolicy, VerificationRequest, Verdict,
+    apply_verdict, verify, Verdict, VerificationError, VerificationPolicy, VerificationRequest,
 };
 
 fn telemetry(peer: &PeerId, active: u32, cap: u32) -> NodeTelemetry {
@@ -226,9 +226,21 @@ fn routing_prefers_high_reputation() {
 #[test]
 fn verification_accepts_matching_outputs() {
     let participants = vec![
-        ("node-a".to_owned(), deterministic(), "the answer".to_owned()),
-        ("node-b".to_owned(), deterministic(), "the answer".to_owned()),
-        ("node-c".to_owned(), deterministic(), "the answer".to_owned()),
+        (
+            "node-a".to_owned(),
+            deterministic(),
+            "the answer".to_owned(),
+        ),
+        (
+            "node-b".to_owned(),
+            deterministic(),
+            "the answer".to_owned(),
+        ),
+        (
+            "node-c".to_owned(),
+            deterministic(),
+            "the answer".to_owned(),
+        ),
     ];
 
     let verdict = match verify(&request(), &participants) {
@@ -439,7 +451,10 @@ fn verification_requires_determinism() {
 
     // Verification is opt-in: off by default, and never forced on all traffic.
     let default_policy = VerificationPolicy::new(VerificationConfig::default());
-    assert!(!default_policy.is_enabled(), "verification is off by default");
+    assert!(
+        !default_policy.is_enabled(),
+        "verification is off by default"
+    );
     assert!(!default_policy.should_verify(0, true));
 
     let policy = VerificationPolicy::new(VerificationConfig {
@@ -448,7 +463,10 @@ fn verification_requires_determinism() {
         ..VerificationConfig::default()
     });
     assert!(policy.should_sample(0));
-    assert!(!policy.should_sample(1), "sampling must not verify every request");
+    assert!(
+        !policy.should_sample(1),
+        "sampling must not verify every request"
+    );
     assert!(policy.should_sample(10));
     assert!(
         policy.should_verify(3, true),

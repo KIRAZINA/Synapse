@@ -13,9 +13,9 @@ use synapse_core::{SynapseError, TokenEvent};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-use libp2p::identity;
 use crate::transport::{build_client_config, SERVER_NAME};
 use crate::wire;
+use libp2p::identity;
 
 /// The error code that is used when a generation is aborted.
 const ABORT_CODE: u32 = 1;
@@ -54,7 +54,12 @@ impl RemoteInferenceClient {
     /// The certificate is the one the remote node published over the control
     /// plane; it is pinned, so the connection is only accepted when the
     /// remote node owns the matching private key.
-    pub fn new(addr: SocketAddr, cert_der: Vec<u8>, keypair: identity::Keypair, nonce: [u8; 32]) -> Result<Self, SynapseError> {
+    pub fn new(
+        addr: SocketAddr,
+        cert_der: Vec<u8>,
+        keypair: identity::Keypair,
+        nonce: [u8; 32],
+    ) -> Result<Self, SynapseError> {
         crate::transport::install_crypto_provider();
 
         let bind_addr: SocketAddr = ([0, 0, 0, 0], 0).into();
@@ -140,12 +145,16 @@ impl RemoteInferenceClient {
                 m.extend_from_slice(&peer_id_bytes);
                 m
             };
-            let sig = self.keypair.sign(&msg).map_err(|err| SynapseError::Network(format!("sign failed: {err}")))?;
-            wire::write_auth(&mut send, &peer_id_bytes, &pk_bytes, &self.nonce, &sig).await.map_err(|err| {
-                SynapseError::Network(format!("failed to send auth: {err}"))
-            })?;
+            let sig = self
+                .keypair
+                .sign(&msg)
+                .map_err(|err| SynapseError::Network(format!("sign failed: {err}")))?;
+            wire::write_auth(&mut send, &peer_id_bytes, &pk_bytes, &self.nonce, &sig)
+                .await
+                .map_err(|err| SynapseError::Network(format!("failed to send auth: {err}")))?;
             let _ = send.finish();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), recv.read_to_end(0)).await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), recv.read_to_end(0)).await;
         }
 
         let (mut send, mut recv) = connection

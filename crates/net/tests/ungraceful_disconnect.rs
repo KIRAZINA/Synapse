@@ -231,7 +231,9 @@ async fn a_dead_client_aborts_the_generation() -> Result<(), Box<dyn std::error:
 
     let endpoint = Endpoint::client((Ipv4Addr::LOCALHOST, 0).into())?;
     let config = build_client_config(transport.cert_der().to_vec())?;
-    let connection = endpoint.connect_with(config, relay_addr, SERVER_NAME)?.await?;
+    let connection = endpoint
+        .connect_with(config, relay_addr, SERVER_NAME)?
+        .await?;
 
     let (send, _recv) = connection.open_bi().await?;
     let mut send = send;
@@ -282,7 +284,12 @@ async fn the_client_abort_handle_aborts_the_generation() -> Result<(), Box<dyn s
     let (transport, server_addr) = start_server(Arc::clone(&provider) as Arc<_>).await?;
 
     let keypair = synapse_net::generate_keypair();
-    let client = RemoteInferenceClient::new(server_addr, transport.cert_der().to_vec(), keypair, [0u8; 32])?;
+    let client = RemoteInferenceClient::new(
+        server_addr,
+        transport.cert_der().to_vec(),
+        keypair,
+        [0u8; 32],
+    )?;
     let (events, abort) = client.generate("hello".to_owned(), MAX_TOKENS).await?;
 
     // Wait for the first tokens, so that the generation is really running.
@@ -326,7 +333,9 @@ async fn a_stream_reset_aborts_the_generation() -> Result<(), Box<dyn std::error
 
     let endpoint = Endpoint::client((Ipv4Addr::LOCALHOST, 0).into())?;
     let config = build_client_config(transport.cert_der().to_vec())?;
-    let connection = endpoint.connect_with(config, server_addr, SERVER_NAME)?.await?;
+    let connection = endpoint
+        .connect_with(config, server_addr, SERVER_NAME)?
+        .await?;
 
     let (mut send, mut recv) = connection.open_bi().await?;
     wire::write_request(&mut send, "hello", MAX_TOKENS).await?;

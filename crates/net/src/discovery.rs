@@ -337,7 +337,9 @@ pub fn ip_from_multiaddr(address: &Multiaddr) -> Option<IpAddr> {
 /// The swarm that is built here is only used to reach the peer: the
 /// generation itself travels over the QUIC data plane, which is completely
 /// independent of the control plane.
-pub async fn fetch_quic_info(target: &Multiaddr) -> Result<(SocketAddr, Vec<u8>, [u8; 32], u64), SynapseError> {
+pub async fn fetch_quic_info(
+    target: &Multiaddr,
+) -> Result<(SocketAddr, Vec<u8>, [u8; 32], u64), SynapseError> {
     let keypair = identity::Keypair::generate_ed25519();
     let behaviour = SynapseBehaviour::new(&keypair)?;
 
@@ -458,15 +460,11 @@ impl DiscoverySnapshot {
     /// node gossiped about itself, because the observed address is known to be
     /// reachable from this client.
     pub fn address_of(&self, telemetry: &NodeTelemetry) -> Option<Multiaddr> {
-        let peer = telemetry
-            .peer_id
-            .parse::<PeerId>()
-            .ok()
-            .or_else(|| {
-                self.addresses
-                    .iter()
-                    .find_map(|(peer, _)| (peer.to_base58() == telemetry.peer_id).then_some(*peer))
-            })?;
+        let peer = telemetry.peer_id.parse::<PeerId>().ok().or_else(|| {
+            self.addresses
+                .iter()
+                .find_map(|(peer, _)| (peer.to_base58() == telemetry.peer_id).then_some(*peer))
+        })?;
 
         let address = self
             .addresses
@@ -548,9 +546,13 @@ fn handle_kad_event(
             ..
         } => {
             for info in result.peers {
-                if let Some(address) = info.addrs.iter().find(|address| is_usable_address(address)) {
+                if let Some(address) = info.addrs.iter().find(|address| is_usable_address(address))
+                {
                     let address = strip_p2p(address);
-                    snapshot.addresses.entry(info.peer_id).or_insert(address.clone());
+                    snapshot
+                        .addresses
+                        .entry(info.peer_id)
+                        .or_insert(address.clone());
                     dial_discovered(swarm, info.peer_id, &address, connected, dialing);
                 }
             }
@@ -641,10 +643,7 @@ pub async fn collect_telemetry(
                         .or_insert_with(|| address.clone());
                 }
                 if !address.is_empty() {
-                    swarm
-                        .behaviour_mut()
-                        .kad
-                        .add_address(&peer_id, address);
+                    swarm.behaviour_mut().kad.add_address(&peer_id, address);
                 }
             }
             libp2p::swarm::SwarmEvent::ConnectionClosed {
@@ -657,9 +656,7 @@ pub async fn collect_telemetry(
                     dialing.remove(&peer_id);
                 }
             }
-            libp2p::swarm::SwarmEvent::OutgoingConnectionError {
-                peer_id, error, ..
-            } => {
+            libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 if let Some(peer) = peer_id {
                     dialing.remove(&peer);
                 }
@@ -724,20 +721,11 @@ pub async fn collect_telemetry(
                             .entry(peer_id)
                             .or_insert_with(|| address.clone());
                     }
-                    swarm
-                        .behaviour_mut()
-                        .kad
-                        .add_address(&peer_id, address);
+                    swarm.behaviour_mut().kad.add_address(&peer_id, address);
                 }
             }
             libp2p::swarm::SwarmEvent::Behaviour(SynapseBehaviourEvent::Kad(event)) => {
-                handle_kad_event(
-                    event,
-                    &mut snapshot,
-                    &connected,
-                    &mut dialing,
-                    &mut swarm,
-                );
+                handle_kad_event(event, &mut snapshot, &connected, &mut dialing, &mut swarm);
             }
             _ => {}
         }

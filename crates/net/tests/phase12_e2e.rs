@@ -20,7 +20,7 @@ use synapse_net::orchestrator::{
 };
 use synapse_net::reputation::ReputationLedger;
 use synapse_net::routing::RoutingTable;
-use synapse_net::verify::{VerificationError, VerificationRequest, Verdict};
+use synapse_net::verify::{Verdict, VerificationError, VerificationRequest};
 
 /// A mock node that returns a fixed output.
 ///
@@ -188,10 +188,7 @@ fn telemetry(peer: &PeerId) -> NodeTelemetry {
 /// A routing table that already knows the peers, so the production
 /// [`VerificationClient`] has a real ledger and a real fan-out.
 fn routing_with_peers(peers: &[PeerId], config: &VerificationConfig) -> Arc<RoutingTable> {
-    let routing = Arc::new(RoutingTable::with_policy(
-        Duration::from_secs(300),
-        config,
-    ));
+    let routing = Arc::new(RoutingTable::with_policy(Duration::from_secs(300), config));
     for peer in peers {
         routing.update(*peer, telemetry(peer));
     }
@@ -352,7 +349,10 @@ async fn no_majority_moves_no_reputation() {
     .await;
 
     assert_eq!(outcome.answered, 3);
-    assert!(!outcome.is_accepted(), "three different answers are not a match");
+    assert!(
+        !outcome.is_accepted(),
+        "three different answers are not a match"
+    );
 
     match outcome.verdict {
         Ok(Verdict::Rejected {
@@ -397,7 +397,10 @@ async fn determinism_enforced_at_fanout() {
     sampled.temperature = 0.7;
     let sampled_request = VerificationRequest::new("prompt", sampled, 16);
     assert!(
-        matches!(sampled_request, Err(VerificationError::NotDeterministic { .. })),
+        matches!(
+            sampled_request,
+            Err(VerificationError::NotDeterministic { .. })
+        ),
         "temperature above zero must be refused"
     );
 
@@ -414,7 +417,11 @@ async fn determinism_enforced_at_fanout() {
 
     // A participant running a different thread count is not comparable.
     let providers: Vec<(String, Determinism, &dyn TokenStreamProvider)> = vec![
-        ("node-a".to_owned(), pinned(), &a as &dyn TokenStreamProvider),
+        (
+            "node-a".to_owned(),
+            pinned(),
+            &a as &dyn TokenStreamProvider,
+        ),
         (
             "node-b".to_owned(),
             Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 8, "cpu"),
@@ -437,12 +444,20 @@ async fn determinism_enforced_at_fanout() {
         ),
         "a different thread count must be refused, not compared"
     );
-    assert_eq!(ledger.score("node-a"), 0.0, "a refusal must not cost anyone");
+    assert_eq!(
+        ledger.score("node-a"),
+        0.0,
+        "a refusal must not cost anyone"
+    );
     assert_eq!(ledger.score("node-b"), 0.0);
 
     // A different backend is refused for the same reason.
     let providers: Vec<(String, Determinism, &dyn TokenStreamProvider)> = vec![
-        ("node-a".to_owned(), pinned(), &a as &dyn TokenStreamProvider),
+        (
+            "node-a".to_owned(),
+            pinned(),
+            &a as &dyn TokenStreamProvider,
+        ),
         (
             "node-b".to_owned(),
             Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 1234, 4, "cuda"),
@@ -464,7 +479,11 @@ async fn determinism_enforced_at_fanout() {
 
     // A different quantization is refused.
     let providers: Vec<(String, Determinism, &dyn TokenStreamProvider)> = vec![
-        ("node-a".to_owned(), pinned(), &a as &dyn TokenStreamProvider),
+        (
+            "node-a".to_owned(),
+            pinned(),
+            &a as &dyn TokenStreamProvider,
+        ),
         (
             "node-b".to_owned(),
             Determinism::greedy("tinyllama-1.1b", "Q8_0", 1234, 4, "cpu"),
@@ -486,7 +505,11 @@ async fn determinism_enforced_at_fanout() {
 
     // A different seed is refused.
     let providers: Vec<(String, Determinism, &dyn TokenStreamProvider)> = vec![
-        ("node-a".to_owned(), pinned(), &a as &dyn TokenStreamProvider),
+        (
+            "node-a".to_owned(),
+            pinned(),
+            &a as &dyn TokenStreamProvider,
+        ),
         (
             "node-b".to_owned(),
             Determinism::greedy("tinyllama-1.1b", "Q4_K_M", 99, 4, "cpu"),
@@ -513,13 +536,20 @@ async fn determinism_enforced_at_fanout() {
     let greedy_b = MockNode::new("four");
     let sampler = MockNode::new("four").not_greedy();
     let outcome = run(
-        &[("node-a", &greedy_a), ("node-b", &greedy_b), ("sampler", &sampler)],
+        &[
+            ("node-a", &greedy_a),
+            ("node-b", &greedy_b),
+            ("sampler", &sampler),
+        ],
         &ledger,
         Duration::from_secs(5),
     )
     .await;
 
-    assert_eq!(outcome.answered, 2, "the sampler is not a comparable answer");
+    assert_eq!(
+        outcome.answered, 2,
+        "the sampler is not a comparable answer"
+    );
     assert_eq!(outcome.non_responses(), vec!["sampler"]);
     assert!(
         !outcome.is_accepted(),

@@ -41,7 +41,8 @@ const SEVEN_B: &str = "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf";
 const SMALL: &str = "models/TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf";
 
 /// A prompt that produces a deterministic, bounded generation.
-const PROMPT: &str = "Explain in two sentences why a bounded queue is useful in an inference server.";
+const PROMPT: &str =
+    "Explain in two sentences why a bounded queue is useful in an inference server.";
 
 fn model_path() -> PathBuf {
     if let Ok(path) = std::env::var("SYNAPSE_PROFILE_MODEL") {
@@ -100,7 +101,9 @@ fn load(capacity: u32, context_length: u32) -> InferencePool {
 
 #[cfg(windows)]
 fn memory() -> Option<(u64, u64)> {
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     let mut counters = PROCESS_MEMORY_COUNTERS {
@@ -111,7 +114,10 @@ fn memory() -> Option<(u64, u64)> {
     // SAFETY: the handle is the current process and the struct is fully
     // initialised with the size the API expects.
     let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
-    (ok != 0).then_some((counters.WorkingSetSize as u64, counters.PeakWorkingSetSize as u64))
+    (ok != 0).then_some((
+        counters.WorkingSetSize as u64,
+        counters.PeakWorkingSetSize as u64,
+    ))
 }
 
 #[cfg(not(windows))]
@@ -612,10 +618,7 @@ fn take_metrics() -> MetricSnapshot {
             }
             "synapse_prefill_ms" => {
                 if let DebugValue::Histogram(values) = value {
-                    snapshot.prefill_ms = values
-                        .iter()
-                        .map(|value| value.into_inner())
-                        .collect();
+                    snapshot.prefill_ms = values.iter().map(|value| value.into_inner()).collect();
                 }
             }
             _ => {}
@@ -624,4 +627,3 @@ fn take_metrics() -> MetricSnapshot {
 
     snapshot
 }
-

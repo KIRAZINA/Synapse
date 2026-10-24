@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use libp2p::PeerId;
-use synapse_core::{Determinism, NodeTelemetry, TokenEvent, TokenStreamProvider, VerificationConfig};
+use synapse_core::{
+    Determinism, NodeTelemetry, TokenEvent, TokenStreamProvider, VerificationConfig,
+};
 use synapse_engine::InferencePool;
 use synapse_net::orchestrator::VerificationClient;
 use synapse_net::routing::RoutingTable;
@@ -33,7 +35,8 @@ use synapse_net::routing::RoutingTable;
 const SEVEN_B: &str = "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf";
 const SMALL: &str = "models/TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf";
 
-const PROMPT: &str = "Explain in two sentences why a bounded queue is useful in an inference server.";
+const PROMPT: &str =
+    "Explain in two sentences why a bounded queue is useful in an inference server.";
 
 fn model_path() -> PathBuf {
     if let Ok(path) = std::env::var("SYNAPSE_PROFILE_MODEL") {
@@ -284,10 +287,7 @@ async fn profile_verification_cost() {
         ..VerificationConfig::default()
     };
     let peers: Vec<PeerId> = (0..3).map(|_| PeerId::random()).collect();
-    let routing = Arc::new(RoutingTable::with_policy(
-        Duration::from_secs(300),
-        &config,
-    ));
+    let routing = Arc::new(RoutingTable::with_policy(Duration::from_secs(300), &config));
     for peer in &peers {
         routing.update(*peer, telemetry(peer, &model));
     }

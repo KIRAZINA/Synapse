@@ -11,34 +11,74 @@ use synapse_net::transport::QuicTransport;
 
 struct SlowProvider;
 impl TokenStreamProvider for SlowProvider {
-    fn generate_streaming(&self, _prompt: String, max_tokens: usize) -> Result<flume::Receiver<TokenEvent>, SynapseError> {
+    fn generate_streaming(
+        &self,
+        _prompt: String,
+        max_tokens: usize,
+    ) -> Result<flume::Receiver<TokenEvent>, SynapseError> {
         let (tx, rx) = flume::unbounded();
         tokio::spawn(async move {
             for _ in 0..max_tokens {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                if tx.send(TokenEvent::Token { text: "x".into(), token_id: 0 }).is_err() { break; }
+                if tx
+                    .send(TokenEvent::Token {
+                        text: "x".into(),
+                        token_id: 0,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         });
         Ok(rx)
     }
-    fn active_requests(&self) -> u32 { 0 }
-    fn max_capacity(&self) -> u32 { 4 }
+    fn active_requests(&self) -> u32 {
+        0
+    }
+    fn max_capacity(&self) -> u32 {
+        4
+    }
 }
 
-async fn start_server(security: SecurityConfig) -> (QuicTransport, SocketAddr, std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8;32],(libp2p::PeerId,u64)>>>, std::sync::Arc<std::sync::Mutex<std::collections::HashMap<libp2p::PeerId, synapse_net::server::PeerState>>>) {
+async fn start_server(
+    security: SecurityConfig,
+) -> (
+    QuicTransport,
+    SocketAddr,
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], (libp2p::PeerId, u64)>>>,
+    std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<libp2p::PeerId, synapse_net::server::PeerState>>,
+    >,
+) {
     let transport = QuicTransport::new().await.unwrap();
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, transport.local_port()));
     let store = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let peer_state = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let server = InferenceServer::new(transport.endpoint().clone(), Arc::new(SlowProvider), security, store.clone(), peer_state.clone());
+    let server = InferenceServer::new(
+        transport.endpoint().clone(),
+        Arc::new(SlowProvider),
+        security,
+        store.clone(),
+        peer_state.clone(),
+    );
     tokio::spawn(server.run());
     (transport, addr, store, peer_state)
 }
 
-fn mint_nonce(store: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8;32],(libp2p::PeerId,u64)>>>, peer: libp2p::PeerId) -> [u8;32] {
-    let mut nonce = [0u8;32];
+fn mint_nonce(
+    store: &std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<[u8; 32], (libp2p::PeerId, u64)>>,
+    >,
+    peer: libp2p::PeerId,
+) -> [u8; 32] {
+    let mut nonce = [0u8; 32];
     getrandom::getrandom(&mut nonce).unwrap();
-    let expiry = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 30000;
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 30000;
     store.lock().unwrap().insert(nonce, (peer, expiry));
     nonce
 }
@@ -54,13 +94,17 @@ async fn per_peer_concurrency_enforced() {
     let (t, addr, store, _ps) = start_server(security).await;
     let nonce = mint_nonce(&store, peer_id);
     // first request
-    let client = RemoteInferenceClient::new(addr, t.cert_der().to_vec(), kp.clone(), nonce).unwrap();
+    let client =
+        RemoteInferenceClient::new(addr, t.cert_der().to_vec(), kp.clone(), nonce).unwrap();
     let (rx1, _abort1) = client.generate("hi".into(), 5).await.unwrap();
     // second request should be rejected (reuse same nonce? consumed; mint new)
     let nonce2 = mint_nonce(&store, peer_id);
     let client2 = RemoteInferenceClient::new(addr, t.cert_der().to_vec(), kp, nonce2).unwrap();
     let res2 = client2.generate("hi".into(), 5).await;
-    if let Ok((rx2,_)) = res2 { let ev = rx2.recv_async().await; assert!(ev.is_err() || matches!(ev.unwrap(), TokenEvent::Error { .. })); }
+    if let Ok((rx2, _)) = res2 {
+        let ev = rx2.recv_async().await;
+        assert!(ev.is_err() || matches!(ev.unwrap(), TokenEvent::Error { .. }));
+    }
     let _ = rx1;
 }
 
@@ -74,7 +118,8 @@ async fn inflight_decrements_on_client_abort() {
     security.access.per_peer_concurrency = 1;
     let (t, addr, store, _ps) = start_server(security).await;
     let nonce = mint_nonce(&store, peer_id);
-    let client = RemoteInferenceClient::new(addr, t.cert_der().to_vec(), kp.clone(), nonce).unwrap();
+    let client =
+        RemoteInferenceClient::new(addr, t.cert_der().to_vec(), kp.clone(), nonce).unwrap();
     let (rx, abort) = client.generate("hi".into(), 100).await.unwrap();
     // abort
     abort.abort();
@@ -106,7 +151,10 @@ async fn token_budget_enforced() {
     let nonce = mint_nonce(&store, peer_id);
     let client = RemoteInferenceClient::new(addr, t.cert_der().to_vec(), kp, nonce).unwrap();
     let res = client.generate("hi".into(), 10).await;
-    if let Ok((rx,_)) = res { let ev = rx.recv_async().await; assert!(ev.is_err() || matches!(ev.unwrap(), TokenEvent::Error { .. })); }
+    if let Ok((rx, _)) = res {
+        let ev = rx.recv_async().await;
+        assert!(ev.is_err() || matches!(ev.unwrap(), TokenEvent::Error { .. }));
+    }
 }
 
 #[tokio::test]
@@ -126,7 +174,10 @@ async fn max_tokens_ceiling() {
     let nonce = mint_nonce(&store, peer_id);
     let client = RemoteInferenceClient::new(addr, t.cert_der().to_vec(), kp, nonce).unwrap();
     let res = client.generate("hi".into(), 10).await;
-    if let Ok((rx,_)) = res { let ev = rx.recv_async().await; assert!(ev.is_err() || matches!(ev.unwrap(), TokenEvent::Error { .. })); }
+    if let Ok((rx, _)) = res {
+        let ev = rx.recv_async().await;
+        assert!(ev.is_err() || matches!(ev.unwrap(), TokenEvent::Error { .. }));
+    }
 }
 
 #[tokio::test]

@@ -32,9 +32,11 @@ use synapse_core::{SecurityConfig, SynapseError, TokenEvent, TokenStreamProvider
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, info, warn};
 
-type NonceStore = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], (libp2p::PeerId, u64)>>>;
+type NonceStore =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], (libp2p::PeerId, u64)>>>;
 
-pub type PeerStateMap = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<libp2p::PeerId, PeerState>>>;
+pub type PeerStateMap =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<libp2p::PeerId, PeerState>>>;
 
 #[derive(Default)]
 pub struct PeerState {
@@ -70,7 +72,13 @@ impl InferenceServer {
         nonce_store: NonceStore,
         peer_state: PeerStateMap,
     ) -> Self {
-        Self { endpoint, provider, security, nonce_store, peer_state }
+        Self {
+            endpoint,
+            provider,
+            security,
+            nonce_store,
+            peer_state,
+        }
     }
 
     /// Accepts connections until the endpoint is closed.
@@ -89,7 +97,8 @@ impl InferenceServer {
                     Ok(connection) => {
                         let remote = connection.remote_address();
                         info!(%remote, "quic connection accepted");
-                        handle_connection(provider, connection, security, nonce_store, peer_state).await;
+                        handle_connection(provider, connection, security, nonce_store, peer_state)
+                            .await;
                     }
                     Err(err) => {
                         warn!("failed to establish the incoming quic connection: {err}");
@@ -192,9 +201,9 @@ async fn handle_stream(
                 let _ = send.finish();
                 return Ok(());
             }
-            let (pid_bytes, pk_bytes, nonce, sig) = wire::read_auth(&mut recv).await.map_err(|err| {
-                SynapseError::Network(format!("failed to read auth: {err}"))
-            })?;
+            let (pid_bytes, pk_bytes, nonce, sig) = wire::read_auth(&mut recv)
+                .await
+                .map_err(|err| SynapseError::Network(format!("failed to read auth: {err}")))?;
             // verify
             let claimed = match libp2p::PeerId::from_bytes(&pid_bytes) {
                 Ok(p) => p,
@@ -219,7 +228,10 @@ async fn handle_stream(
                 let mut store = nonce_store.lock().unwrap_or_else(|e| e.into_inner());
                 store.remove(&nonce)
             };
-            let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
             let mut ok = false;
             if let Some((issued_peer, expiry)) = issued {
                 if expiry >= now_ms {
@@ -242,7 +254,12 @@ async fn handle_stream(
             // allowlist check
             if !allow_loopback {
                 if security.mode == "allowlist" {
-                    if !security.access.trusted_peers.iter().any(|p| p == &claimed.to_base58()) {
+                    if !security
+                        .access
+                        .trusted_peers
+                        .iter()
+                        .any(|p| p == &claimed.to_base58())
+                    {
                         warn!(%remote, peer = %claimed, "peer not allowlisted");
                         return Err(SynapseError::Network("not allowlisted".into()));
                     }
@@ -277,7 +294,8 @@ async fn handle_stream(
 
             // max_tokens ceiling
             if max_tokens as u64 > security.max_tokens_per_request {
-                metrics::counter!("synapse_auth_rejected_total", "reason" => "max_tokens_exceeded").increment(1);
+                metrics::counter!("synapse_auth_rejected_total", "reason" => "max_tokens_exceeded")
+                    .increment(1);
                 return Err(SynapseError::Network("max_tokens_exceeded".into()));
             }
 
@@ -302,11 +320,17 @@ async fn handle_stream(
                         let mut map = peer_state.lock().unwrap_or_else(|e| e.into_inner());
                         let st = map.entry(peer).or_default();
                         while let Some((t, _)) = st.budget.front() {
-                            if now.duration_since(*t).as_secs() >= 60 { st.budget.pop_front(); } else { break; }
+                            if now.duration_since(*t).as_secs() >= 60 {
+                                st.budget.pop_front();
+                            } else {
+                                break;
+                            }
                         }
                         let used: u64 = st.budget.iter().map(|(_, t)| t).sum();
                         if used + max_tokens as u64 > security.access.per_peer_tokens_per_minute {
-                            if let Some(st) = map.get_mut(&peer) { st.inflight = st.inflight.saturating_sub(1); }
+                            if let Some(st) = map.get_mut(&peer) {
+                                st.inflight = st.inflight.saturating_sub(1);
+                            }
                             metrics::counter!("synapse_token_budget_rejected_total").increment(1);
                             metrics::counter!("synapse_auth_rejected_total", "reason" => "token_budget").increment(1);
                             return Err(SynapseError::Network("token_budget".into()));
@@ -316,7 +340,8 @@ async fn handle_stream(
                 }
             }
 
-            let result = serve_generation(provider, send, recv, prompt, max_tokens, cancelled, greedy).await;
+            let result =
+                serve_generation(provider, send, recv, prompt, max_tokens, cancelled, greedy).await;
 
             // decrement inflight
             if !allow_loopback {
@@ -372,7 +397,8 @@ async fn serve_generation(
             provider.generate_streaming_greedy(prompt, max_tokens as usize)
         } else {
             Err(SynapseError::Engine(
-                "this node cannot decode greedily, so it cannot serve a verified request".to_owned(),
+                "this node cannot decode greedily, so it cannot serve a verified request"
+                    .to_owned(),
             ))
         }
     } else {

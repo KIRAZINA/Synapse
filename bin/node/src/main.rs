@@ -267,7 +267,8 @@ async fn run() -> Result<()> {
                     Err(err) => error!("the verified request failed: {err}"),
                 }
             } else {
-                match forward_prompt(&cli.target[0], prompt, cli.max_tokens, shutdown_receiver).await
+                match forward_prompt(&cli.target[0], prompt, cli.max_tokens, shutdown_receiver)
+                    .await
                 {
                     Ok(()) => info!("the remote generation finished"),
                     Err(err) => error!("the remote generation failed: {err}"),
@@ -554,7 +555,11 @@ async fn forward_prompt_verified(
         let keypair = synapse_net::generate_keypair();
         let client = RemoteInferenceClient::new(addr, cert_der, keypair, nonce)?;
         endpoints.push(addr);
-        providers.push((peer, determinism.clone(), Arc::new(RemoteProvider { client })));
+        providers.push((
+            peer,
+            determinism.clone(),
+            Arc::new(RemoteProvider { client }),
+        ));
     }
 
     if providers.len() < redundancy {

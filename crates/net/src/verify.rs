@@ -351,7 +351,10 @@ pub fn verify(
     if !strict_majority {
         metrics::counter!("synapse_verification_mismatches_total").increment(1);
         return Ok(Verdict::Rejected {
-            participants: participants.iter().map(|(peer, _, _)| peer.clone()).collect(),
+            participants: participants
+                .iter()
+                .map(|(peer, _, _)| peer.clone())
+                .collect(),
             distinct_outputs: ranked.len(),
         });
     }

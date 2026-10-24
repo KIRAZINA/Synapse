@@ -27,7 +27,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-type NonceStore = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], (PeerId, u64)>>>;
+type NonceStore =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], (PeerId, u64)>>>;
 
 use futures_util::StreamExt;
 use libp2p::request_response;
@@ -39,15 +40,13 @@ use synapse_core::{
 use tracing::{debug, info, warn};
 
 use crate::discovery::{
-    telemetry_request_topic, telemetry_topic, HandshakeRequest, HandshakeResponse, SynapseBehaviour,
-    SynapseBehaviourEvent, TELEMETRY_REQUEST_PAYLOAD,
+    telemetry_request_topic, telemetry_topic, HandshakeRequest, HandshakeResponse,
+    SynapseBehaviour, SynapseBehaviourEvent, TELEMETRY_REQUEST_PAYLOAD,
 };
 use crate::routing::{encode_telemetry, now_ms, RoutingTable};
 use crate::server::InferenceServer;
 use crate::transport::{QuicTransport, TransportSettings};
 use crate::verify::VerificationPolicy;
-
-
 
 /// How often the telemetry of a node is broadcast.
 pub const TELEMETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -473,10 +472,10 @@ impl NetworkNode {
                                 .or_insert(SocketAddr::new(ip, 0));
                         }
                     }
-                    libp2p::kad::Event::RoutingUpdated { peer, addresses, .. } => {
-                        if let Some(ip) =
-                            addresses.iter().find_map(discovery::ip_from_multiaddr)
-                        {
+                    libp2p::kad::Event::RoutingUpdated {
+                        peer, addresses, ..
+                    } => {
+                        if let Some(ip) = addresses.iter().find_map(discovery::ip_from_multiaddr) {
                             self.peer_addresses
                                 .entry(*peer)
                                 .or_insert(SocketAddr::new(ip, 0));
@@ -592,7 +591,6 @@ impl NetworkNode {
         });
     }
 }
-
 
 /// Generates a fresh libp2p keypair for data-plane authentication.
 pub fn generate_keypair() -> libp2p::identity::Keypair {

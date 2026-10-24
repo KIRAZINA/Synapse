@@ -302,11 +302,19 @@ pub fn stop_reason_from_u8(value: u8) -> io::Result<StopReason> {
 }
 
 /// Writes an AUTH frame.
-pub async fn write_auth<W>(writer: &mut W, client_peer_id: &[u8], public_key: &[u8], nonce: &[u8; 32], signature: &[u8]) -> io::Result<()>
+pub async fn write_auth<W>(
+    writer: &mut W,
+    client_peer_id: &[u8],
+    public_key: &[u8],
+    nonce: &[u8; 32],
+    signature: &[u8],
+) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    let mut frame = Vec::with_capacity(1 + 2 + client_peer_id.len() + 2 + public_key.len() + 32 + 2 + signature.len());
+    let mut frame = Vec::with_capacity(
+        1 + 2 + client_peer_id.len() + 2 + public_key.len() + 32 + 2 + signature.len(),
+    );
     frame.push(CMD_AUTH);
     frame.extend_from_slice(&(client_peer_id.len() as u16).to_be_bytes());
     frame.extend_from_slice(client_peer_id);
@@ -329,7 +337,10 @@ where
     reader.read_exact(&mut pid_len).await?;
     let pid_len = u16::from_be_bytes(pid_len) as usize;
     if pid_len > 256 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "peer id too long"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer id too long",
+        ));
     }
     let mut pid = vec![0u8; pid_len];
     reader.read_exact(&mut pid).await?;
@@ -337,7 +348,10 @@ where
     reader.read_exact(&mut pk_len).await?;
     let pk_len = u16::from_be_bytes(pk_len) as usize;
     if pk_len > 1024 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "public key too long"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "public key too long",
+        ));
     }
     let mut pk = vec![0u8; pk_len];
     reader.read_exact(&mut pk).await?;
@@ -347,7 +361,10 @@ where
     reader.read_exact(&mut sig_len).await?;
     let sig_len = u16::from_be_bytes(sig_len) as usize;
     if sig_len > 1024 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "signature too long"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "signature too long",
+        ));
     }
     let mut sig = vec![0u8; sig_len];
     reader.read_exact(&mut sig).await?;

@@ -363,9 +363,7 @@ impl SlotGuard {
             let live = lock_registry(&self.registry).live;
             if live == 0 {
                 self.zero_capacity.store(true, Ordering::SeqCst);
-                error!(
-                    "all inference slots retired; the node is unusable and must be restarted"
-                );
+                error!("all inference slots retired; the node is unusable and must be restarted");
             }
         }
 
@@ -657,8 +655,14 @@ fn admission_loop(
         };
 
         let prefill_from = shared.min(request.tokens.len().saturating_sub(1));
-        let Some(guard) = checkout_slot(&mut registry, index, &active, &registry_arc, &wakeup, &zero_capacity)
-        else {
+        let Some(guard) = checkout_slot(
+            &mut registry,
+            index,
+            &active,
+            &registry_arc,
+            &wakeup,
+            &zero_capacity,
+        ) else {
             registry.queue.push_front(request);
             registry = wait_for_next(&wakeup, registry);
             continue;
@@ -684,7 +688,14 @@ fn admission_loop(
             metrics::counter!("synapse_slot_affinity_matches_total").increment(1);
         }
 
-        if let Err(err) = dispatch_command(guard, tokens, prefill_from, max_tokens, sampling, token_sender) {
+        if let Err(err) = dispatch_command(
+            guard,
+            tokens,
+            prefill_from,
+            max_tokens,
+            sampling,
+            token_sender,
+        ) {
             warn!(%err, "a queued request could not be dispatched");
         }
 
@@ -1189,7 +1200,14 @@ impl InferencePool {
             let (guard, prefill_from) = self
                 .acquire_affine(&tokens)
                 .map_err(|err| SynapseError::Engine(err.to_string()))?;
-            dispatch_command(guard, tokens, prefill_from, max_tokens, sampling, token_sender)?;
+            dispatch_command(
+                guard,
+                tokens,
+                prefill_from,
+                max_tokens,
+                sampling,
+                token_sender,
+            )?;
         } else {
             // Capture the monotonic admission instant before any lock or enqueue
             // attempt, so the deadline is not shortened by lock contention.
@@ -1240,7 +1258,14 @@ impl InferencePool {
                     metrics::counter!("synapse_slot_affinity_matches_total").increment(1);
                 }
 
-                return dispatch_command(guard, tokens, reusable, max_tokens, sampling, token_sender);
+                return dispatch_command(
+                    guard,
+                    tokens,
+                    reusable,
+                    max_tokens,
+                    sampling,
+                    token_sender,
+                );
             }
         }
 
@@ -1256,8 +1281,7 @@ impl InferencePool {
         if registry.queue.len() >= self.queue_capacity {
             drop(registry);
             metrics::counter!("synapse_queue_rejected_total", "reason" => "full").increment(1);
-            metrics::histogram!("synapse_queue_rejected_wait_ms", "reason" => "full")
-                .record(0.0);
+            metrics::histogram!("synapse_queue_rejected_wait_ms", "reason" => "full").record(0.0);
             return Err(SynapseError::Engine(
                 "the inference queue is full (queue full)".to_owned(),
             ));
